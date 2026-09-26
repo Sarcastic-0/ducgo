@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ducgo v2.0.0 — English-only, CLI-only passive deception tripwires.
+// ducgo v2.0.0 - English-only, CLI-only passive deception tripwires.
 // Node.js stdlib ONLY. Zero runtime dependencies. Exit codes: 0 ok, 1 error.
 // Data dir stays %USERPROFILE%\.miragenet (MIRAGENET_DIR overrides for tests).
 import * as fs from 'node:fs';
@@ -42,7 +42,7 @@ import {
 import * as ui from './ui.js';
 
 const VERSION = '2.0.0';
-const DURESS_MESSAGE = 'All clear — no threats detected.';
+const DURESS_MESSAGE = 'All clear - no threats detected.';
 
 // ---------- command registry (exactly 70) ----------
 export const COMMANDS = [
@@ -283,7 +283,7 @@ function printGroupedCommands() {
 function printHelp() {
   ui.printBanner();
   console.log('');
-  console.log(`ducgo v${VERSION} — passive deception tripwires (CLI only, English only)`);
+  console.log(`ducgo v${VERSION} - passive deception tripwires (CLI only, English only)`);
   console.log('');
   console.log('Usage: ducgo <command> [options]   (every command supports --help)');
   console.log('');
@@ -299,7 +299,7 @@ function printHelp() {
   console.log('');
   console.log(ui.dim('Duress: entering the duress PIN at any PIN prompt shows a fake all-clear and records a silent alert.'));
   console.log(ui.dim('Data: %USERPROFILE%\\.miragenet\\ (auth.json, events.jsonl, config.json). MIRAGENET_DIR overrides it.'));
-  console.log(ui.dim('Engine runs foreground only — press Ctrl+C to stop. No daemon/background mode.'));
+  console.log(ui.dim('Engine runs foreground only - press Ctrl+C to stop. No daemon/background mode.'));
   console.log(ui.dim('Colors: set NO_COLOR=1 to disable ANSI colors. Exit codes: 0 ok, 1 error.'));
 }
 function cmdUsage(name) {
@@ -307,7 +307,7 @@ function cmdUsage(name) {
   if (!c) { console.error(`Unknown command: ${name}`); process.exit(1); }
   ui.printBanner();
   console.log('');
-  console.log(ui.bold(`ducgo ${c.name}`) + ` — ${c.desc}`);
+  console.log(ui.bold(`ducgo ${c.name}`) + ` - ${c.desc}`);
   console.log(`Usage: ${c.usage}`);
 }
 function groupByIp(events) {
@@ -456,7 +456,7 @@ async function cmdStart(rest) {
   const liveCfg = loadConfig(dataDir);
   const enabledPorts = ports.filter((p) => !liveCfg.disabled.includes(`honey-tcp:${p}`));
   if (enabledPorts.length !== ports.length) ui.warn(`Skipping disabled trap(s): ${ports.filter((p) => liveCfg.disabled.includes(`honey-tcp:${p}`)).join(', ')}`);
-  ui.info(`Engine foreground only — press Ctrl+C to stop. No daemon mode.`);
+  ui.info(`Engine foreground only - press Ctrl+C to stop. No daemon mode.`);
   const emit = (ev) => {
     try { appendEvent(dataDir, ev); } catch { /* best effort */ }
     ui.printEvent(ev);
@@ -469,7 +469,7 @@ async function cmdStart(rest) {
       const custom = liveCfg.banners[String(port)];
       ui.ok(`Listening: honey TCP :${port} (LAN-visible by design)${custom ? ` [custom banner: ${custom.slice(0, 60)}]` : ''}`);
     } catch (err) {
-      emit(makeEvent('system', `honey-tcp:${port}`, '127.0.0.1', `Port ${port} unavailable (${(err && err.code) || (err && err.message) || err}) — continuing without it`, 'medium'));
+      emit(makeEvent('system', `honey-tcp:${port}`, '127.0.0.1', `Port ${port} unavailable (${(err && err.code) || (err && err.message) || err}) - continuing without it`, 'medium'));
     }
   }
   try {
@@ -484,7 +484,7 @@ async function cmdStart(rest) {
   const watchers = watchDirs(liveDirs, emit);
   if (liveDirs.length > 0) ui.ok(`Watching ${liveDirs.length} canary directorie(s): ${liveDirs.join(', ')}`);
   else ui.dim('No canary directories deployed. Use "ducgo deploy <dir>" to add tripwires.');
-  emit(makeEvent('system', 'engine', '127.0.0.1', `Trap mesh started — TCP [${enabledPorts.join(', ')}], HTTP 127.0.0.1:${httpPort}`, 'low'));
+  emit(makeEvent('system', 'engine', '127.0.0.1', `Trap mesh started - TCP [${enabledPorts.join(', ')}], HTTP 127.0.0.1:${httpPort}`, 'low'));
   console.log(ui.bold('Trap mesh running. Press Ctrl+C to stop.'));
   let stopping = false;
   const cleanupAndExit = async (code) => {
@@ -597,7 +597,7 @@ async function cmdTrapDisable(rest) {
 async function cmdHttpShow(rest) {
   if (wantsHelp(rest)) return cmdUsage('http-show');
   const cfg = loadConfig(getDataDir());
-  ui.info(`Fake panel on 127.0.0.1:${cfg.httpPort} — title "${cfg.httpTitle || 'Admin Login'}" (posted passwords are never stored)`);
+  ui.info(`Fake panel on 127.0.0.1:${cfg.httpPort} - title "${cfg.httpTitle || 'Admin Login'}" (posted passwords are never stored)`);
   const preview = FAKE_LOGIN_PAGE.replace('Admin Login', cfg.httpTitle || 'Admin Login').slice(0, 600);
   console.log(ui.box('http-show (fake panel preview)', preview.split('\n').slice(0, 12)));
 }
@@ -761,7 +761,7 @@ async function cmdCanaryShow(rest) {
   try { content = fs.readFileSync(path.resolve(file), 'utf8'); } catch { fail(`Cannot read: ${file}`); }
   const m = content.match(/MIRAGETOKEN-[A-Za-z0-9-]+/);
   if (!m) fail('No canary token found in that file.');
-  console.log(ui.box(`canary token — ${path.basename(path.resolve(file))}`, [m[0]]));
+  console.log(ui.box(`canary token - ${path.basename(path.resolve(file))}`, [m[0]]));
 }
 
 // ================= EVENTS =================
@@ -794,7 +794,7 @@ async function cmdEventsTail(rest) {
   let events = readEvents(dataDir).slice(-n);
   for (const e of events) ui.printEvent(e);
   if (!follow) { ui.dim(`${events.length} event(s) shown.`); return; }
-  ui.info('Following live — Ctrl+C to stop.');
+  ui.info('Following live - Ctrl+C to stop.');
   const fp = eventsPath(dataDir);
   let known = 0;
   try { known = readEvents(dataDir).length; } catch { known = 0; }
@@ -897,7 +897,7 @@ async function cmdAttackers(rest) {
   const rows = groupByIp(readEvents(dataDir));
   if (rows.length === 0) { ui.dim('No attacker touches recorded.'); return; }
   console.log(ui.table(['IP', 'TOUCHES', 'FIRST SEEN', 'LAST SEEN', 'TOP TRAP'], rows.map((r) => [r.ip, String(r.touches), String(r.first), String(r.last), r.top])));
-  ui.dim(`${rows.length} unique IP(s). Naive IP grouping — not attribution.`);
+  ui.dim(`${rows.length} unique IP(s). Naive IP grouping - not attribution.`);
 }
 async function cmdAttackerShow(rest) {
   if (wantsHelp(rest)) return cmdUsage('attacker-show');
@@ -1152,7 +1152,7 @@ async function cmdAbout(rest) {
   if (wantsHelp(rest)) return cmdUsage('about');
   ui.printBanner();
   console.log('');
-  console.log(ui.box('about ducgo', ['passive deception tripwires: honey TCP + honey HTTP + canary files', '100% passive/defensive — only listens locally, never scans or attacks', 'English only. CLI only. Zero runtime dependencies (Node stdlib only).']));
+  console.log(ui.box('about ducgo', ['passive deception tripwires: honey TCP + honey HTTP + canary files', '100% passive/defensive - only listens locally, never scans or attacks', 'English only. CLI only. Zero runtime dependencies (Node stdlib only).']));
   console.log(ui.dim('Limits: fs.watch sees modify/rename/delete only (NOT silent reads); TCP ports are LAN-visible by design;'));
   console.log(ui.dim('no encryption-at-rest beyond OS permissions; attacker table is naive IP grouping; duress hides the view, not the install.'));
 }
@@ -1214,11 +1214,11 @@ async function cmdUptime(rest) {
 }
 async function cmdTips(rest) {
   if (wantsHelp(rest)) return cmdUsage('tips');
-  console.log(ui.box('tips', ['1. Run "ducgo doctor" after setup to verify ports + data dir', '2. Deploy canaries where they look natural (docs, backups)', '3. "ducgo start" is foreground only — keep the window open', '4. Review with "ducgo events" and "ducgo top-attackers"', '5. Test duress safely with a scratch MIRAGENET_DIR first']));
+  console.log(ui.box('tips', ['1. Run "ducgo doctor" after setup to verify ports + data dir', '2. Deploy canaries where they look natural (docs, backups)', '3. "ducgo start" is foreground only - keep the window open', '4. Review with "ducgo events" and "ducgo top-attackers"', '5. Test duress safely with a scratch MIRAGENET_DIR first']));
 }
 async function cmdLicense(rest) {
   if (wantsHelp(rest)) return cmdUsage('license');
-  console.log(ui.box('license', ['ducgo v2.0.0 — passive defensive tool. No warranty.', 'Zero runtime dependencies. Node.js stdlib only.', 'Use only on systems/networks you own or are authorized to defend.']));
+  console.log(ui.box('license', ['ducgo v2.0.0 - passive defensive tool. No warranty.', 'Zero runtime dependencies. Node.js stdlib only.', 'Use only on systems/networks you own or are authorized to defend.']));
 }
 async function cmdVerifyInstall(rest) {
   if (wantsHelp(rest)) return cmdUsage('verify-install');
@@ -1260,7 +1260,7 @@ async function cmdStats(rest) {
 }
 async function cmdSupport(rest) {
   if (wantsHelp(rest)) return cmdUsage('support');
-  console.log(ui.box('support', ['scope: passive tripwires on your own machines only', 'no offensive use — this tool never scans or attacks', 'check "ducgo doctor" + "ducgo about" for limits first']));
+  console.log(ui.box('support', ['scope: passive tripwires on your own machines only', 'no offensive use - this tool never scans or attacks', 'check "ducgo doctor" + "ducgo about" for limits first']));
 }
 
 // ---------- main ----------

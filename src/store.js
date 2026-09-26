@@ -1,4 +1,4 @@
-// MirageNet v2 — data directory: config.json + events.jsonl. Stdlib only.
+// MirageNet v2 - data directory: config.json + events.jsonl. Stdlib only.
 // Default data dir is %USERPROFILE%\.miragenet. MIRAGENET_DIR overrides it
 // (used by the selftest and scripting so tests never touch the real store).
 import * as fs from 'node:fs';
@@ -60,7 +60,7 @@ export function loadConfig(dataDir) {
           if (Array.isArray(v)) cfg.notes[String(k)] = v.filter((n) => n && typeof n === 'object').slice(0, 200);
         }
       }
-      // Preserve unknown future keys? No — strict schema keeps file clean.
+      // Preserve unknown future keys? No - strict schema keeps file clean.
     }
   } catch {
     /* missing or corrupt config -> defaults */

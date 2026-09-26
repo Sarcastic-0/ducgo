@@ -1,4 +1,4 @@
-// ducgo v2.0.0 selftest — stdlib only.
+// ducgo v2.0.0 selftest - stdlib only.
 // Run: node test/selftest.js  (also: "npm test", "ducgo selftest").
 // Prints PASS lines; exits non-zero on any failure. 23+ checks.
 import * as fs from 'node:fs';
@@ -38,7 +38,7 @@ async function waitFor(fn, timeoutMs) {
   }
 }
 
-// (1) auth store tests — KEPT from v2
+// (1) auth store tests - KEPT from v2
 async function testAuth() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-auth-'));
   try {
@@ -65,7 +65,7 @@ async function testAuth() {
   }
 }
 
-// (2) trap tests on ephemeral ports — KEPT from v2
+// (2) trap tests on ephemeral ports - KEPT from v2
 async function testTraps() {
   const httpEvents = [];
   const httpSrv = await startHoneyHttp(0, '127.0.0.1', (ev) => httpEvents.push(ev));
@@ -138,7 +138,7 @@ async function testTraps() {
   await closeServer(tcpSrv);
 }
 
-// (3) canary test — KEPT from v2
+// (3) canary test - KEPT from v2
 async function testCanary() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-canary-'));
   try {
@@ -178,7 +178,7 @@ function testCount() {
 function testBanner() {
   const b = banner();
   assert(b.includes('DUCGO') || b.includes('████'), 'ui: banner contains DUCGO logo');
-  assert(b.includes(TAGLINE), 'ui: banner contains Arabic tagline');
+  assert(b.includes(TAGLINE), 'ui: banner contains English tagline');
   assert(b.includes(`ducgo v${VERSION}`), 'ui: banner contains version line');
   assert(typeof table(['A'], [['b']]) === 'string', 'ui: table() works');
   assert(typeof box('t', ['x']) === 'string', 'ui: box() works');
@@ -219,7 +219,7 @@ function testSmokeHelp() {
 export async function runSelfTest() {
   failures = 0;
   passes = 0;
-  console.log('ducgo selftest — auth, traps, canary, count, ui, smoke');
+  console.log('ducgo selftest - auth, traps, canary, count, ui, smoke');
   await testAuth();
   await testTraps();
   await testCanary();
@@ -230,9 +230,9 @@ export async function runSelfTest() {
   testSmokeHelp();
   console.log(`\n${passes} check(s) passed.`);
   if (failures === 0) {
-    console.log('SELFTEST PASS — all checks passed');
+    console.log('SELFTEST PASS - all checks passed');
   } else {
-    console.error(`SELFTEST FAIL — ${failures} check(s) failed`);
+    console.error(`SELFTEST FAIL - ${failures} check(s) failed`);
   }
   return failures === 0;
 }

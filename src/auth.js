@@ -1,5 +1,5 @@
-// MirageNet v2 — PIN + duress-PIN store (PBKDF2-SHA256, 200k iterations).
-// Node.js stdlib only. Never stores PIN material — only salted hashes.
+// MirageNet v2 - PIN + duress-PIN store (PBKDF2-SHA256, 200k iterations).
+// Node.js stdlib only. Never stores PIN material - only salted hashes.
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';

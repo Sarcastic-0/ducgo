@@ -1,17 +1,17 @@
-# ducgo v2.0.0 — Deception Tripwire Mesh (CLI only)
+# ducgo v2.0.0 - Deception Tripwire Mesh (CLI only)
 
 A lightweight **passive deception (tripwire)** tool for individuals and small teams:
 honey TCP ports, a honey HTTP admin panel, and canary files. Any touch of a trap
 is logged as an event with the visitor's fingerprint. Includes duress-PIN mode
 (fake all-clear message + silent alert).
 
-> 100% passive/defensive. Zero offensive traffic — the tool only listens on
+> 100% passive/defensive. Zero offensive traffic - the tool only listens on
 > ports, serves a fake login page, and watches files. It never scans, probes,
 > or attacks anything.
 
 English only (output). CLI only. **Zero runtime dependencies** (Node.js standard
-library only — hand-rolled args, minimal ANSI colors with `NO_COLOR` support).
-Exit codes: `0` success, `1` error. No daemon/background mode — `start` runs
+library only - hand-rolled args, minimal ANSI colors with `NO_COLOR` support).
+Exit codes: `0` success, `1` error. No daemon/background mode - `start` runs
 foreground only until `Ctrl+C`.
 
 ```
@@ -21,11 +21,11 @@ foreground only until `Ctrl+C`.
 ██║  ██║██║   ██║██║   ██║██║   ██║██║   ██║
 ██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝
 ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝
-لا يستطيع احد سباقي
+No one can race me
 ducgo v2.0.0
 ```
 
-(The dim line above is the Arabic tagline — the only non-English output.)
+(The dim line above is the English tagline.)
 
 ## Install
 
@@ -36,7 +36,7 @@ cd "C:\Users\LORD laptop\Documents\MirageNet"
 node src/cli.js --help
 ```
 
-The bin is `ducgo` (`./src/cli.js`, shebang kept). Do NOT `npm link` — running
+The bin is `ducgo` (`./src/cli.js`, shebang kept). Do NOT `npm link` - running
 `node src/cli.js` is sufficient.
 
 Set `NO_COLOR=1` to disable ANSI colors (plain logo; tagline + version still shown).
@@ -64,7 +64,7 @@ $env:MIRAGENET_DIR = "$env:TEMP\ducgo-test"
 "alpha-9912`nalpha-9912`nduress-4417`nduress-4417" | node src/cli.js setup
 node src/cli.js demo
 "alpha-9912" | node src/cli.js deploy "$env:TEMP\ducgo-test\decoys"
-node src/cli.js commands --count   # → 70
+node src/cli.js commands --count   # -> 70
 ```
 
 ## 70 commands
@@ -104,7 +104,7 @@ node src/cli.js setup
 node src/cli.js status
 ```
 
-Foreground only — there is no `start-bg`/daemon. `status` checks ports; stop with `Ctrl+C`.
+Foreground only - there is no `start-bg`/daemon. `status` checks ports; stop with `Ctrl+C`.
 
 ### traps (9)
 
@@ -205,10 +205,10 @@ Foreground only — there is no `start-bg`/daemon. `status` checks ports; stop w
 Entering the duress PIN at **any** PIN prompt prints exactly:
 
 ```text
-All clear — no threats detected.
+All clear - no threats detected.
 ```
 
-…appends a silent `{type:"duress", ...}` event to `events.jsonl`, and exits 0.
+...appends a silent `{type:"duress", ...}` event to `events.jsonl`, and exits 0.
 The screen never reveals that duress mode was triggered.
 
 ## Security model
@@ -226,17 +226,17 @@ The screen never reveals that duress mode was triggered.
 
 ## Honest limits
 
-- `fs.watch` reports **modify/rename/delete** — it does **NOT** detect silent
+- `fs.watch` reports **modify/rename/delete** - it does **NOT** detect silent
   reads (opening a canary in Notepad without saving trips nothing). This is an
   OS limitation, not a bug.
 - Honey TCP ports are **LAN-visible by design**; anyone port-scanning you will
   see open ports. That is the point of a tripwire, but don't run this on
   networks where unexplained open ports violate policy.
-- Default ports (2222/2323/8080) may already be in use — the mesh logs a
+- Default ports (2222/2323/8080) may already be in use - the mesh logs a
   `system` event per unavailable port and keeps the rest running.
 - No encryption-at-rest beyond OS file permissions for the event log; the log
   contains visitor IPs, banner bytes, and usernames (never passwords).
-- The `attackers` table is naive IP grouping — no attribution, and
+- The `attackers` table is naive IP grouping - no attribution, and
   spoofed/internal IPs mean little on their own.
 - Duress mode hides the real view but cannot hide that the tool is installed.
 - `demo` injects a synthetic event clearly tagged `DEMO` / type `sim`.

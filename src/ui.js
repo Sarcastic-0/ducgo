@@ -1,7 +1,7 @@
-// ducgo v2 — styled SOC UI kit. Node.js stdlib only.
+// ducgo v2 - styled SOC UI kit. Node.js stdlib only.
 // Minimal ANSI colors with NO_COLOR support. Used by EVERY command.
 export const VERSION = '2.0.0';
-export const TAGLINE = 'لا يستطيع احد سباقي';
+export const TAGLINE = 'No one can race me';
 
 export const USE_COLOR = !('NO_COLOR' in process.env);
 
@@ -34,7 +34,7 @@ export function faint(s) {
   if (!USE_COLOR) return String(s);
   return ANSI.faint + String(s) + ANSI.reset;
 }
-// dim() is an alias for faint() — used across all commands for subtle lines.
+// dim() is an alias for faint() - used across all commands for subtle lines.
 export function dim(s) { return faint(s); }
 
 export function severityColor(sev) {
@@ -57,7 +57,7 @@ export function err(msg) { console.error(paint('red', `  [ERR] ${msg}`)); }
 export function info(msg) { console.log(paint('cyan', `  [..] ${msg}`)); }
 export function warn(msg) { console.log(paint('yellow', `  [!!] ${msg}`)); }
 
-// ---- banner: big DUCGO logo, gradient red->amber; DIM Arabic tagline; version ----
+// ---- banner: big DUCGO logo, gradient red->amber; DIM English tagline; version ----
 const LOGO = [
   '██████╗ ██╗   ██╗ ██████╗  ██████╗  ██████╗ ',
   '██╔══██╗██║   ██║██╔════╝ ██╔════╝ ██╔═══██╗',
@@ -123,7 +123,7 @@ export function formatEvent(ev) {
   const trap = String(ev.trap ?? '');
   const detail = String(ev.detail ?? '').replace(/\s+/g, ' ').slice(0, 140);
   const ip = String(ev.ip ?? '');
-  return `[${t}] ${sev} ${type} ${trap} — ${detail} (${ip})`;
+  return `[${t}] ${sev} ${type} ${trap} - ${detail} (${ip})`;
 }
 
 export function printEvent(ev) {
