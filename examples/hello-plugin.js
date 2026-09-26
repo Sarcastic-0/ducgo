@@ -1,8 +1,10 @@
-// ducgo example plugin - stdlib only.
+// ducgo example plugin - stdlib only, vm-safe (no require/process/fs).
 // A plugin = one .js file exporting { name, version?, commands: [{ name, desc, usage?, run(ctx) }] }.
 // Limits: plugins may ONLY add commands. They may NOT hook the trap engine or auth.
 // ctx = { ui, args, config, store, callBuiltIn(name,args), dataDir }.
-// Trust: only enable plugins you trust - they run as your user. Added DISABLED by default.
+// Sandbox: loaded in node:vm with ONLY {ctx, console, Math, JSON, URL, TextEncoder/Decoder}.
+// vm is isolation-aid, NOT a security boundary - review source, use --unsafe only if you trust it.
+// Trust: only enable plugins you trust - they run as your user. Added DISABLED by default, enable needs CONFIRM.
 export default {
   name: 'hello-plugin',
   version: '1.0.0',

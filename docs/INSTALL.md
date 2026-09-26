@@ -1,7 +1,12 @@
 # ducgo v3.0.4 - Install & platform notes (Windows / Linux / macOS)
 
-Same 92 commands everywhere. Platform gaps degrade with clean guidance
-(never crash). Zero runtime dependencies (Node.js stdlib only).
+Same 92 commands everywhere (+ 14 extras, never counted). Platform gaps
+degrade with clean guidance (never crash). Zero runtime dependencies
+(Node.js stdlib only). No new OS prerequisites for the production-grade
+update (atime, stealth, log encryption, caps, geoip, lockout, sandbox,
+alerts): everything uses inbox tools + stdlib (`node:vm`, `node:crypto`).
+`mmdb-dump` is external and OPTIONAL (only if you convert .mmdb to JSON/CSV
+for `geoip-load`).
 
 ## 1. Prerequisites per OS
 

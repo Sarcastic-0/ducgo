@@ -396,16 +396,38 @@ The screen never reveals that duress mode was triggered.
 
 - `fs.watch` reports **modify/rename/delete** - it does **NOT** detect silent
   reads (opening a canary in Notepad without saving trips nothing). This is an
-  OS limitation, not a bug.
+  OS limitation, not a bug. `atime-watch [extra]` complements it (polls atime
+  vs baseline, reports ACCESSED vs MODIFIED) but is NOT a replacement:
+  noatime/relatime mounts and some filesystems (tmpfs, network FS) disable or
+  coalesce atime. Check `mount | grep noatime` on Linux.
 - Honey TCP ports are **LAN-visible by design**; anyone port-scanning you will
   see open ports. That is the point of a tripwire, but don't run this on
-  networks where unexplained open ports violate policy.
+  networks where unexplained open ports violate policy. Stealth banners
+  (`trap-add --stealth-banner ssh|ftp|telnet`, imitations of OpenSSH/FileZilla/
+  MS Telnet) blend in better, but `trap-fingerprint-check [extra]` still flags
+  giveaways (empty banner, honey/ducgo/mirage keywords, default ducgo texts).
 - Default ports (2222/2323/8080) may already be in use - the mesh logs a
   `system` event per unavailable port and keeps the rest running.
-- No encryption-at-rest beyond OS file permissions for the event log; the log
-  contains visitor IPs, banner bytes, and usernames (never passwords).
+- Event log is AES-256-GCM encrypted at rest (PIN-derived key, per-file salt
+  in config, envelope `{v:1,k:'p'|'d',iv,ct}` per line; `config-set encryption
+  on` re-encrypts, `off` writes plaintext going forward, mixed files read
+  transparently). Limits: `auth_failure` (failed PIN, no key) and `demo`
+  (no PIN) are plaintext even when ON (mixed file); duress writes k:'d' with
+  the duress-derived key (normal reads try PIN key then duress key via wrapped
+  copy). `events-decrypt [extra]` exports plaintext - delete after use.
+  The log contains visitor IPs, banner bytes, and usernames (never passwords,
+  never PINs).
 - The `attackers` table is naive IP grouping - no attribution, and
-  spoofed/internal IPs mean little on their own.
+  spoofed/internal IPs mean little on their own. Offline geo (`geoip-load`
+  `[extra]` JSON `{ranges:[{from,to,country,city?}]}` IPv4 or CSV, no network
+  calls ever; `.mmdb` needs external conversion via mmdb-dump
+  https://github.com/maxmind/mmdb-dump) adds GEO columns only when loaded,
+  plus a `confidence` 0-100 heuristic with transparent weights: base 50,
+  RFC1918/local -30 (likely NAT), single touch +10 (uncertain), 3+ trap types
+  +25, canary token +20, capped 0-100 (see `tips`).
+- PIN lockout: 3 fails 5s delay, 5 fails 60s, 10 fails 15min lock
+  (`{failCount,lockUntil}` in auth.json; success resets; every failure logs
+  `auth_failure` with source command, no PIN).
 - Duress mode hides the real view but cannot hide that the tool is installed.
 - `demo` injects a synthetic event clearly tagged `DEMO` / type `sim`.
 - Engine is foreground only (no daemon). `status`/`engine-check` inspect ports;
@@ -413,7 +435,19 @@ The screen never reveals that duress mode was triggered.
 - Sentinel `threat-score` is a 0-100 heuristic from local events with a shown
   factor table - not a verdict. ARP / evil-twin / DNS flags are heuristics;
   expect false positives (DHCP, repeaters, CDN rotation). No packet capture:
-  pair with Npcap / Wireshark for real traffic review.
+  pair with Npcap / Wireshark for real traffic review. Capability probes
+  (`doctor`, `sniff-check`) validate tools (`tcpdump --version`, `pktmon
+  status`, output-shape) and print tool/problem/fix guidance instead of
+  silent garbage.
+- Alerting is local-only (`config-set alerts off|beep|file|both`, file default
+  `<dataDir>/alerts.log`, one JSON `{alertAt,time,type,trap,ip,detail,severity}`
+  per line for SIEM tailing; beep is `\x07` best-effort). Email/SMS/webhooks
+  would break local-only/zero-deps and belong in separate optional plugins,
+  not core.
+- Plugins load in `node:vm` with ONLY `{ctx, console, Math, JSON, URL,
+  TextEncoder/Decoder}` (no require/process/fs). `vm` is isolation-aid, NOT a
+  security boundary against determined malicious code - review source, use
+  `plugin-enable --unsafe` (full privileges, recorded) only if you trust it.
 
 ## Plugins (commands only)
 
@@ -423,11 +457,19 @@ Plugin dir is `<dataDir>\plugins`. A plugin = one `.js` file exporting
 
 Limits: plugins may ONLY add commands. They may NOT hook the trap engine
 or auth. Collisions with built-ins are skipped with a warning. Broken
-plugins warn and are skipped - the tool continues.
+plugins warn and are skipped - the tool continues. Sandbox: `node:vm` with
+ONLY `{ctx, console, Math, JSON, URL, TextEncoder/Decoder}` (no
+require/process/fs/child_process/net). `vm` is isolation-aid, NOT a security
+boundary - review source before enabling.
 
 Trust warning: `plugin-add <file>` copies the file, prints SHA-256,
-DISABLED by default + warning. Only enable plugins you trust - they run
-as your user with your privileges. Management (`plugin-add`,
+DISABLED by default + EXPLICIT full-privilege warning (can read files, run
+commands, access network). `plugin-enable` requires typing CONFIRM
+(interactive; `--yes-confirm` for scripting with a loud warning). If a plugin
+needs full privileges (uses require/process), enable ONLY with
+`plugin-enable --unsafe` (loud warning, recorded) - otherwise it stays
+sandboxed and privileged APIs fail. Only enable plugins you trust.
+Management (`plugin-add`,
 `plugin-enable`, `plugin-disable`, `plugin-list`, `plugin-show`,
 `plugin-remove`) requires the normal PIN; the duress PIN never reveals
 the plugin list (all-clear + silent log, behaves as if no plugins exist).
@@ -438,7 +480,7 @@ Example (`examples/hello-plugin.js`, commands `hello`, `threat-tip`):
 ```powershell
 "alpha-9912" | node src/cli.js plugin-add examples/hello-plugin.js
 "alpha-9912" | node src/cli.js plugin-list
-"alpha-9912" | node src/cli.js plugin-enable hello-plugin
+"alpha-9912`nCONFIRM" | node src/cli.js plugin-enable hello-plugin
 "alpha-9912" | node src/cli.js hello
 "alpha-9912" | node src/cli.js threat-tip
 ```
@@ -474,23 +516,37 @@ Macros are `;`-separated: stop-on-first-error in one-shot mode, per-line
 (continue) in REPL.
 
 The 92 contract: `commands --count` stays exactly 92. Extras
-(plugin commands, aliases, macros, plus 9 extra built-ins) appear only in
+(plugin commands, aliases, macros, plus 14 extra built-ins) appear only in
 the footer line (`+ N plugin command(s), ...`) and are never counted.
+
+### Extra commands [extra] (never counted in the 92)
+
+| Command | Description |
+|---|---|
+| `atime-watch <dir> [--interval 60] [--duration 0]` [extra] | Poll atime for silent reads (ACCESSED vs MODIFIED, needs PIN) |
+| `trap-fingerprint-check <port>` [extra] | Grab own honey banner, PASS/WARN vs Nmap-style + giveaways (needs PIN) |
+| `events-decrypt <file>` [extra] | Decrypted plaintext export + security warning (needs PIN) |
+| `geoip-load <file>` [extra] | Load offline IPv4 JSON/CSV range DB (needs PIN) |
+| `geoip-clear` [extra] | Clear geo DB (needs PIN) |
+
+`trap-add` also accepts `--stealth-banner ssh|ftp|telnet` (flag, still 92).
+`config-set` also accepts `encryption on|off`, `alerts off|beep|file|both`,
+`alerts-file <path>` (no new commands).
 
 ## Project layout
 
 ```text
 package.json        ESM ("type": "module"), bin { ducgo: ./src/cli.js }, no deps
-src/cli.js          hand-rolled args, hidden PIN prompt, 92 built-ins + extras (plugins/completion/alias/macro, never counted)
+src/cli.js          hand-rolled args, hidden PIN prompt, 92 built-ins + extras (plugins/completion/alias/macro/atime/fingerprint/decrypt/geoip, never counted)
 src/ui.js           banner/box/table/severity/ok/err/info/dim/event-format/progress (NO_COLOR aware)
-src/auth.js         PBKDF2 PIN + duress store (dataDir-injected, testable)
-src/traps.js        honey TCP / honey HTTP / canary watch / decoy deploy (stdlib only)
+src/auth.js         PBKDF2 PIN + duress store + lockout policy (pure) + {failCount,lockUntil} (dataDir-injected, testable)
+src/traps.js        honey TCP (stealth imitations) / honey HTTP / canary watch / decoy deploy + atime poll + fingerprint (stdlib only)
 src/platform.js     windows/linux/darwin mapping + isAdmin/hostsPath/dataDir/hasCmd (stdlib only)
-src/sentinel.js     read-only network watch parsers + baselines + threat score + integrity (stdlib only, no capture; per-OS backends)
-src/sniff.js        per-OS capture (pktmon/tcpdump/dumpcap) + shared local parser + analyzer (stdlib only)
-src/store.js        data dir: config.json (now +plugins/aliases/macros) + events.jsonl (+disabled/banners/notes) + sentinel-baseline.json + integrity.json
+src/sentinel.js     read-only network watch parsers (ss/netstat/BusyBox/Darwin/BSD/ip-neigh/nmcli/iwlist/airport) + capability probes + baselines + threat score + integrity (stdlib only, no capture; per-OS backends)
+src/sniff.js        per-OS capture (pktmon/tcpdump/dumpcap) + probeCaptureTool + shared local parser + analyzer (stdlib only)
+src/store.js        data dir: config.json (now +stealth/encryption/alerts/geoip/plugins/aliases/macros) + events.jsonl (AES-GCM envelopes + plaintext, mixed read) + alerts.log + sentinel-baseline.json + integrity.json + atime-baseline.json
 docs/INSTALL.md     per-OS prerequisites, npm link/unlink, data locations, executed-vs-fixture-tested matrix
-examples/hello-plugin.js   example plugin (commands hello, threat-tip) used by tests
-test/selftest.js    auth + traps (ephemeral) + canary + count==92 + ui + per-command --help smoke + plugins/completion/alias/macro + sentinel/integrity
-test/crossplatform.js   platform unit tests (injected os strings, no global patching) + linux/macOS parser fixtures + tcpdump analyzer reuse + count==92 smoke
+examples/hello-plugin.js   example plugin (commands hello, threat-tip, vm-safe) used by tests
+test/selftest.js    auth + traps + canary + count==92 + ui + smoke + plugins/CONFIRM/sandbox + completion/alias/macro + sentinel/integrity + atime/stealth/enc/lockout/alerts/geoip/caps + extras smoke
+test/crossplatform.js   platform units + linux (ss/RHEL/BusyBox/ip-neigh/nmcli/iwlist) + macOS (arp variants/airport) + tcpdump + guidance shapes + count==92 + extras smoke
 ```

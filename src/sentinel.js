@@ -204,6 +204,106 @@ export function parseLinuxNetstat(text) {
   return { listeners, conns };
 }
 
+// ---------- BusyBox `netstat -tuln` parser (no PID column) ----------
+// BusyBox (Alpine, embedded) output:
+//   Active Internet connections (only servers)
+//   Proto Recv-Q Send-Q Local Address  Foreign Address  State
+//   tcp   0      0      0.0.0.0:22      0.0.0.0:*        LISTEN
+// Same { listeners, conns } shape, pids always 0 (BusyBox has no -p).
+export function parseBusyBoxNetstat(text) {
+  const listeners = [];
+  const conns = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^proto\b/i.test(line)) continue;
+    if (/^active/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) continue;
+    const p0 = parts[0].toUpperCase();
+    const proto = p0.startsWith('TCP') ? 'TCP' : p0.startsWith('UDP') ? 'UDP' : null;
+    if (!proto) continue;
+    const local = parts[3] || '';
+    const foreign = parts[4] || '';
+    const state = (parts[5] || '').toUpperCase();
+    const port = extractPort(local);
+    if (state === 'LISTEN' || (proto === 'UDP' && /:(\*)$/.test(foreign))) {
+      listeners.push({ proto, local, port, pid: 0 });
+    } else if (proto === 'TCP' && state) {
+      conns.push({
+        proto, local, remote: foreign, remoteIp: extractIp(foreign), remotePort: extractPort(foreign),
+        state: state || 'UNKNOWN', pid: 0,
+      });
+    }
+  }
+  return { listeners, conns };
+}
+
+// ---------- capability probes (lightweight, precise guidance) ----------
+// Before using each external tool, run a cheap probe (version flag or
+// status) + output-shape validation. On mismatch return precise guidance
+// {tool, problem, fix} instead of silent garbage. Never throws.
+export function probeTool(cmd, args = [], timeoutMs = 5000) {
+  const r = runOs(cmd, args, timeoutMs);
+  return r;
+}
+
+export function capabilityReport(plat = detectPlatform()) {
+  const out = [];
+  const push = (tool, ok, problem, fix) => out.push({ tool, ok, problem, fix });
+  if (plat === 'windows') {
+    let r = probeTool('netstat', ['-ano']);
+    if (!r.ok) push('netstat', false, `netstat -ano failed (${r.error})`, 'inbox on Windows - check PATH / run in cmd');
+    else if (!/LISTENING/i.test(r.stdout) && !/Proto/i.test(r.stdout)) push('netstat', false, 'unexpected netstat output shape (no Proto/LISTENING header)', 'run `netstat -ano` manually to verify');
+    else push('netstat', true, '', '');
+    r = probeTool('arp', ['-a']);
+    if (!r.ok) push('arp', false, `arp -a failed (${r.error})`, 'inbox on Windows - check PATH');
+    else if (!/\d+\.\d+\.\d+\.\d+/.test(r.stdout)) push('arp', false, 'unexpected arp output shape (no IPv4)', 'run `arp -a` manually');
+    else push('arp', true, '', '');
+    r = probeTool('tasklist', ['/FO', 'CSV', '/NH']);
+    if (!r.ok) push('tasklist', false, `tasklist failed (${r.error})`, 'inbox on Windows - check PATH');
+    else push('tasklist', true, '', '');
+    r = probeTool('netsh', ['wlan', 'show', 'drivers']);
+    if (!r.ok) push('netsh', false, `netsh wlan failed (${r.error})`, 'needs Windows + WLAN adapter');
+    else push('netsh', true, '', '');
+    r = probeTool('whoami', ['/groups']);
+    if (!r.ok) push('whoami', false, `whoami /groups failed (${r.error})`, 'inbox - check PATH');
+    else push('whoami', true, '', '');
+  } else if (plat === 'linux') {
+    let r = probeTool('ss', ['-V']);
+    if (!r.ok) {
+      const fb = probeTool('netstat', ['-V']);
+      if (!fb.ok) push('ss/netstat', false, 'neither `ss -V` nor `netstat -V` succeeded', 'install iproute2 (`sudo apt install iproute2`) or net-tools');
+      else push('ss/netstat', true, '', 'using legacy netstat fallback');
+    } else push('ss', true, '', '');
+    r = probeTool('ip', ['--version']);
+    if (!r.ok) {
+      const fb = probeTool('arp', ['-V']);
+      if (!fb.ok) push('ip/arp', false, 'neither `ip --version` nor arp found', 'install iproute2 for `ip neigh` or net-tools for `arp -a`');
+      else push('ip/arp', true, '', 'using arp fallback');
+    } else push('ip', true, '', '');
+    r = probeTool('nmcli', ['--version']);
+    if (!r.ok) push('nmcli', false, '`nmcli --version` failed', 'install network-manager for `nmcli dev wifi` (or wireless-tools for `iwlist`)');
+    else push('nmcli', true, '', '');
+    r = probeTool('id', ['-u']);
+    if (!r.ok) push('id', false, '`id -u` failed', 'coreutils missing - check PATH');
+    else push('id', true, '', '');
+  } else {
+    const r = probeTool('netstat', ['-anv', '-p', 'tcp']);
+    if (!r.ok) push('netstat', false, `netstat -anv failed (${r.error})`, 'ships with macOS - check PATH');
+    else push('netstat', true, '', '');
+    const a = probeTool('arp', ['-a']);
+    if (!a.ok) push('arp', false, '`arp -a` failed', 'ships with macOS - check PATH');
+    else if (!/\(.*\)\s+at\s+/i.test(a.stdout)) push('arp', false, 'unexpected BSD arp shape (no "(ip) at mac on iface")', 'run `arp -a` manually');
+    else push('arp', true, '', '');
+    const idr = probeTool('id', ['-u']);
+    if (!idr.ok) push('id', false, '`id -u` failed', 'check PATH');
+    else push('id', true, '', '');
+  }
+  return out;
+}
+
 // ---------- macOS `netstat -anv -p tcp/udp` parser ----------
 // Darwin uses dots (not colons) for ports: `192.168.1.5.54321`, `*.5353`,
 // `*.*`. There is NO PID column (best-effort: a `pid=NNN` token is honored

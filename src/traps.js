@@ -57,10 +57,136 @@ button{width:100%;padding:10px;margin-top:10px;border:0;border-radius:6px;backgr
 <form method="POST" action="/login"><input name="username" placeholder="Username" autocomplete="off"><input name="password" type="password" placeholder="Password"><button type="submit">Sign in</button></form>
 <p style="font-size:11px;color:#64748b">Restricted area. All access is logged.</p></div></body></html>`;
 
-function fakeBanner(port) {
+function fakeBanner(port, stealthKind) {
+  // Stealth banners are IMITATIONS for deception (not real services):
+  // they mimic common Nmap signatures to blend in. Marked as imitations.
+  if (stealthKind === 'ssh') return 'SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n'; // imitation, not real OpenSSH
+  if (stealthKind === 'ftp') return '220 FileZilla Server 1.7.0\r\n'; // imitation, not real FileZilla
+  if (stealthKind === 'telnet') return 'Welcome to Microsoft Telnet Service\r\n'; // imitation, not real MS Telnet
   if (port === 2222) return 'SSH-2.0-OpenSSH_9.2 MirageNet\r\n';
   if (port === 2323) return 'Welcome to Telnet service. Login: ';
   return 'HTTP/1.1 200 OK\r\nServer: MirageNet/1.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
+}
+
+// Stealth banner catalog (imitations, documented as such).
+export const STEALTH_BANNERS = {
+  ssh: 'SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n',
+  ftp: '220 FileZilla Server 1.7.0\r\n',
+  telnet: 'Welcome to Microsoft Telnet Service\r\n',
+};
+
+export function stealthBannerFor(kind) {
+  const k = String(kind || '').toLowerCase();
+  return STEALTH_BANNERS[k] || null;
+}
+
+// Fingerprint a grabbed banner against Nmap-style signatures + honeypot
+// giveaways. Returns {verdict:'PASS'|'WARN', reasons:[...]}.
+// PASS: matches a known stealth imitation (ssh/ftp/telnet above).
+// WARN: empty, contains honey/ducgo/mirage/default texts, or unknown.
+export function fingerprintBanner(bannerText) {
+  const reasons = [];
+  const s = String(bannerText || '');
+  if (!s.trim()) {
+    return { verdict: 'WARN', reasons: ['empty banner (honeypot giveaway: real services greet)'] };
+  }
+  const low = s.toLowerCase();
+  if (low.includes('honey') || low.includes('ducgo') || low.includes('mirage') || low.includes('miragenet')) {
+    reasons.push('contains honeypot keyword (honey/ducgo/mirage)');
+  }
+  if (s.includes('MirageNet/1.0') || s.includes('OpenSSH_9.2 MirageNet') || s.includes('Welcome to Telnet service. Login:')) {
+    reasons.push('matches default ducgo banner text (giveaway)');
+  }
+  // Nmap-style realistic signatures (our stealth imitations):
+  if (s.includes('SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6')) {
+    if (reasons.length === 0) return { verdict: 'PASS', reasons: ['matches stealth SSH imitation (Nmap-style OpenSSH signature)'] };
+    reasons.push('ssh imitation present but mixed with giveaway text');
+  }
+  if (s.includes('220 FileZilla Server 1.7.0')) {
+    if (reasons.length === 0) return { verdict: 'PASS', reasons: ['matches stealth FTP imitation (Nmap-style FileZilla signature)'] };
+    reasons.push('ftp imitation present but mixed with giveaway text');
+  }
+  if (s.includes('Welcome to Microsoft Telnet Service')) {
+    if (reasons.length === 0) return { verdict: 'PASS', reasons: ['matches stealth Telnet imitation (Nmap-style MS Telnet signature)'] };
+    reasons.push('telnet imitation present but mixed with giveaway text');
+  }
+  // Generic realistic shapes (not giveaways) get a cautious PASS:
+  if (reasons.length === 0) {
+    if (/^SSH-2\.0-OpenSSH/i.test(s.trim())) return { verdict: 'PASS', reasons: ['SSH version string looks realistic (no giveaway keywords)'] };
+    if (/^220\s+.+FTP/i.test(s.trim()) || /^220\s+FileZilla/i.test(s.trim())) return { verdict: 'PASS', reasons: ['FTP 220 greeting looks realistic (no giveaway keywords)'] };
+    if (/telnet/i.test(s) && !/ducgo|mirage|honey/i.test(low)) return { verdict: 'PASS', reasons: ['Telnet greeting has no giveaway keywords'] };
+    return { verdict: 'WARN', reasons: ['unknown banner shape (not a known stealth imitation, no Nmap-style match)'] };
+  }
+  return { verdict: 'WARN', reasons };
+}
+
+// ---------- ATIME WATCH (opt-in silent-read detection, complements fs.watch) ----------
+// fs.watch reports modify/rename/delete only, NOT silent reads. atime-watch
+// polls fs.statSync atimeMs vs a baseline (in-memory + persisted to
+// <dataDir>/atime-baseline.json) and reports ACCESSED (atime newer,
+// mtime/size unchanged) vs MODIFIED (mtime/size changed).
+// Honest limits: noatime/relatime mounts and some filesystems (tmpfs,
+// network FS) disable or coalesce atime. Check `mount | grep noatime` on
+// Linux, `mount | grep noatime` / relatime on macOS. If atime never advances,
+// this tool reports nothing (by design, not a bug).
+export function atimeBaselinePath(dataDir) {
+  return path.join(dataDir, 'atime-baseline.json');
+}
+
+export function snapshotAtimeDir(dir, recursive = true) {
+  const out = {};
+  const root = path.resolve(dir);
+  const walk = (d) => {
+    let entries = [];
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const fp = path.join(d, e.name);
+      try {
+        if (e.isDirectory()) { if (recursive) walk(fp); continue; }
+        if (!e.isFile() && !e.isSymbolicLink()) continue;
+        const st = fs.statSync(fp);
+        if (!st.isFile()) continue;
+        out[fp] = { atimeMs: st.atimeMs, mtimeMs: st.mtimeMs, size: st.size };
+      } catch { /* ignore unreadable */ }
+    }
+  };
+  walk(root);
+  return out;
+}
+
+export function diffAtime(baseline, current) {
+  const events = [];
+  const base = baseline || {};
+  const cur = current || {};
+  for (const [fp, c] of Object.entries(cur)) {
+    const b = base[fp];
+    if (!b) { events.push({ path: fp, kind: 'CREATED', detail: `new file: ${fp}` }); continue; }
+    const atimeNewer = Number(c.atimeMs) > Number(b.atimeMs) + 1;
+    const mtimeSame = Number(c.mtimeMs) === Number(b.mtimeMs) && Number(c.size) === Number(b.size);
+    const modified = Number(c.mtimeMs) !== Number(b.mtimeMs) || Number(c.size) !== Number(b.size);
+    if (modified) {
+      events.push({ path: fp, kind: 'MODIFIED', detail: `mtime/size changed: ${fp}` });
+    } else if (atimeNewer && mtimeSame) {
+      events.push({ path: fp, kind: 'ACCESSED', detail: `atime newer, content unchanged (silent read): ${fp}` });
+    }
+  }
+  for (const fp of Object.keys(base)) {
+    if (!(fp in cur)) events.push({ path: fp, kind: 'DELETED', detail: `deleted: ${fp}` });
+  }
+  return events;
+}
+
+export function loadAtimeBaseline(dataDir) {
+  try {
+    const j = JSON.parse(fs.readFileSync(atimeBaselinePath(dataDir), 'utf8'));
+    if (j && typeof j === 'object') return j;
+  } catch { /* none */ }
+  return null;
+}
+
+export function saveAtimeBaseline(dataDir, snapshot) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(atimeBaselinePath(dataDir), JSON.stringify({ savedAt: new Date().toISOString(), files: snapshot }, null, 2), 'utf8');
 }
 
 function sanitizePreview(buf, max = MAX_BANNER_BYTES) {
@@ -76,9 +202,13 @@ function cleanIP(addr) {
 
 // Honey TCP listener: sends a fake banner, logs the connection plus any
 // banner-grab bytes (preview capped at 256B), then drops the socket after 5s.
+// opts.bannerText overrides fakeBanner (stealth imitations); opts.stealth
+// ('ssh'|'ftp'|'telnet') selects a stealth imitation.
 export function startHoneyTcp(port, onEvent, opts = {}) {
   const host = opts.host ?? '0.0.0.0';
   const closeAfterMs = opts.closeAfterMs ?? CLOSE_AFTER_MS;
+  const stealthKind = opts.stealth ? String(opts.stealth).toLowerCase() : null;
+  const bannerOverride = opts.bannerText || (stealthKind ? stealthBannerFor(stealthKind) : null);
   let livePort = port;
   return new Promise((resolve, reject) => {
     const server = net.createServer((socket) => {
@@ -86,7 +216,7 @@ export function startHoneyTcp(port, onEvent, opts = {}) {
       const remotePort = socket.remotePort ?? 0;
       const trap = `honey-tcp:${livePort}`;
       try {
-        socket.write(fakeBanner(livePort));
+        socket.write(bannerOverride || fakeBanner(livePort, stealthKind));
       } catch {
         /* ignore */
       }

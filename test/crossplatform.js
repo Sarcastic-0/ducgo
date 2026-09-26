@@ -16,7 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { platform, isAdmin, hostsPath, dataDir, hasCmd } from '../src/platform.js';
 import * as sentinel from '../src/sentinel.js';
 import * as sniff from '../src/sniff.js';
-import { COMMANDS } from '../src/cli.js';
+import { COMMANDS, EXTRA_BUILTINS } from '../src/cli.js';
 
 let failures = 0;
 let passes = 0;
@@ -264,12 +264,34 @@ function testSniffBackends() {
   assert(typeof dl.present === 'boolean' && typeof dl.detail === 'string', 'xplat: linux driverStatus shape');
 }
 
+const RHEL_NETSTAT_SAMPLE = [
+  'Active Internet connections (only servers)',
+  'Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name',
+  'tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      1234/sshd',
+  'tcp        0      0 127.0.0.1:25            0.0.0.0:*               LISTEN      567/sendmail',
+  'udp        0      0 0.0.0.0:68              0.0.0.0:*                           444/dhclient',
+].join('\n');
+
+const BUSYBOX_NETSTAT_SAMPLE = [
+  'Active Internet connections (only servers)',
+  'Proto Recv-Q Send-Q Local Address          Foreign Address        State',
+  'tcp        0      0 0.0.0.0:22             0.0.0.0:*              LISTEN',
+  'tcp        0      0 127.0.0.1:80           0.0.0.0:*              LISTEN',
+  'udp        0      0 0.0.0.0:53             0.0.0.0:*              ',
+].join('\n');
+
+const MACOS_ARP_VARIANT = [
+  'gateway (192.168.1.254) at aa:bb:cc:11:22:33 on en0 ifscope [ethernet]',
+  '? (192.168.1.50) at 11:22:33:44:55:66 on en1 ifscope [ethernet]',
+  '? (192.168.1.51) at (incomplete) on en1 ifscope [ethernet]',
+].join('\n');
+
 function testContractAndSmoke() {
   const saved = Object.prototype.hasOwnProperty.call(process.env, 'MIRAGENET_DIR') ? process.env.MIRAGENET_DIR : undefined;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-xplat-'));
   try {
     assert(COMMANDS.length === 92, `xplat: built-ins exactly 92 (got ${COMMANDS.length})`);
-    const env = { ...process.env, MIRAGENET_DIR: dir };
+    const env = { ...process.env, MIRAGENET_DIR: dir, DUC_NO_LOCK_SLEEP: '1' };
     const c = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8', timeout: 15000, env });
     assert(c.status === 0 && String(c.stdout || '').trim() === '92', 'xplat: commands --count prints exactly 92');
     for (const cmd of ['doctor', 'sysinfo', 'sniff-check']) {
@@ -280,6 +302,27 @@ function testContractAndSmoke() {
     }
     const chk = spawnSync(process.execPath, [cliPath(), 'sniff-check'], { encoding: 'utf8', timeout: 15000, env });
     assert(/pktmon|tcpdump|dumpcap/i.test(String(chk.stdout || '')), 'xplat: sniff-check names a backend');
+    // New extras smoke (never counted, --help exit 0).
+    assert(EXTRA_BUILTINS.length === 14, `xplat: extras exactly 14 (got ${EXTRA_BUILTINS.length})`);
+    for (const cmd of ['atime-watch', 'trap-fingerprint-check', 'events-decrypt', 'geoip-load', 'geoip-clear']) {
+      const r = spawnSync(process.execPath, [cliPath(), cmd, '--help'], { encoding: 'utf8', timeout: 15000, env });
+      const out = String(r.stdout || '') + String(r.stderr || '');
+      assert(r.status === 0 && /Usage/i.test(out), `xplat: extras smoke ${cmd} --help exits 0`);
+    }
+    // RHEL legacy netstat + BusyBox + macOS arp variant through parsers.
+    const rhel = sentinel.parseLinuxNetstat(RHEL_NETSTAT_SAMPLE);
+    assert(rhel.listeners.length === 3 && rhel.listeners.some((l) => l.port === 22 && l.pid === 1234), 'xplat: RHEL legacy netstat fixture (3 listeners incl. UDP, pid 1234)');
+    const bb = sentinel.parseBusyBoxNetstat(BUSYBOX_NETSTAT_SAMPLE);
+    assert(bb.listeners.length === 3 && bb.listeners.every((l) => l.pid === 0), 'xplat: BusyBox netstat fixture (3 listeners, pid 0, no PID column)');
+    assert(bb.listeners.some((l) => l.port === 80), 'xplat: BusyBox :80 parsed');
+    const macVar = sentinel.parseArpBsd(MACOS_ARP_VARIANT);
+    assert(macVar.length === 2 && macVar[0].iface === 'en0', 'xplat: macOS arp variant (gateway + en1, incomplete skipped)');
+    // Guidance shapes: capabilityReport + probeCaptureTool (tool/problem/fix).
+    const rep = sentinel.capabilityReport('linux');
+    assert(Array.isArray(rep) && rep.length >= 3, 'xplat: linux capabilityReport rows');
+    for (const row of rep) assert(typeof row.tool === 'string' && typeof row.ok === 'boolean' && typeof row.fix === 'string', `xplat: guidance shape for ${row.tool}`);
+    const probe = sniff.probeCaptureTool('linux');
+    assert(typeof probe.tool === 'string' && typeof probe.ok === 'boolean' && typeof probe.problem === 'string' && typeof probe.fix === 'string', 'xplat: probeCaptureTool guidance shape (tool/problem/fix)');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     if (saved === undefined) delete process.env.MIRAGENET_DIR;

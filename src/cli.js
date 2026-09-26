@@ -9,7 +9,8 @@ import * as net from 'node:net';
 import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { isSetup, setupPins, verifyPin, loadAuth, changeAccessPin, changeDuressPin } from './auth.js';
+import * as vm from 'node:vm';
+import { isSetup, setupPins, verifyPin, loadAuth, changeAccessPin, changeDuressPin, getLockoutDelay, isLockedAt, loadLockState, recordAuthFailure, resetLockState } from './auth.js';
 import {
   getDataDir,
   ensureDataDir,
@@ -28,6 +29,21 @@ import {
   getAttackerNotes,
   DEFAULT_PORTS,
   DEFAULT_HTTP_PORT,
+  deriveEncKey,
+  ensureEncSalt,
+  unlockEvents,
+  setSessionKeys,
+  setupEventEncryption,
+  rewrapAfterNormalPinChange,
+  rewrapAfterDuressPinChange,
+  reencryptFileWithSession,
+  alertsPath,
+  ipToInt,
+  loadGeoDbFile,
+  lookupGeoIp,
+  loadGeoDbForDir,
+  isLocalIp,
+  geoConfidence,
 } from './store.js';
 import {
   startHoneyTcp,
@@ -40,6 +56,14 @@ import {
   closeServer,
   getServerPort,
   FAKE_LOGIN_PAGE,
+  STEALTH_BANNERS,
+  stealthBannerFor,
+  fingerprintBanner,
+  snapshotAtimeDir,
+  diffAtime,
+  loadAtimeBaseline,
+  saveAtimeBaseline,
+  atimeBaselinePath,
 } from './traps.js';
 import * as ui from './ui.js';
 import * as sentinel from './sentinel.js';
@@ -161,13 +185,15 @@ export const COMMAND_COUNT = COMMANDS.length;
 
 // ---------- extras (NEVER counted in the 92 contract) ----------
 // Built-in extras: plugin management (6) + completion + alias + macro = 9,
-// plus hidden __complete. None of these live in COMMANDS, so
-// `commands --count` stays exactly 92. They are listed only in the footer
-// line (`+ N plugin command(s), ...`) and via __complete/REPL completer.
+// plus atime-watch + trap-fingerprint-check + events-decrypt + geoip-load +
+// geoip-clear = 5 new (total 14 visible extras), plus hidden __complete.
+// None of these live in COMMANDS, so `commands --count` stays exactly 92.
+// They are listed only in the footer line (`+ N plugin command(s), ...`)
+// and via __complete/REPL completer.
 // Plugins may ONLY add commands - they may NOT hook the trap engine or auth.
 export const EXTRA_BUILTINS = [
   { name: 'plugin-add', group: 'extra', desc: 'Copy a plugin file into the store (disabled by default)', usage: 'ducgo plugin-add <file>' },
-  { name: 'plugin-enable', group: 'extra', desc: 'Enable a plugin (needs PIN)', usage: 'ducgo plugin-enable <id>' },
+  { name: 'plugin-enable', group: 'extra', desc: 'Enable a plugin (needs PIN + CONFIRM)', usage: 'ducgo plugin-enable <id> [--yes-confirm] [--unsafe]' },
   { name: 'plugin-disable', group: 'extra', desc: 'Disable a plugin (needs PIN)', usage: 'ducgo plugin-disable <id>' },
   { name: 'plugin-list', group: 'extra', desc: 'List plugins (needs PIN)', usage: 'ducgo plugin-list' },
   { name: 'plugin-show', group: 'extra', desc: 'Show one plugin (needs PIN)', usage: 'ducgo plugin-show <id>' },
@@ -175,6 +201,11 @@ export const EXTRA_BUILTINS = [
   { name: 'completion', group: 'extra', desc: 'Print/install shell completion', usage: 'ducgo completion powershell|bash [--install] [--uninstall]' },
   { name: 'alias', group: 'extra', desc: 'Manage command aliases (needs PIN)', usage: 'ducgo alias set|get|list|remove ...' },
   { name: 'macro', group: 'extra', desc: 'Manage command macros (needs PIN)', usage: 'ducgo macro set|list|run|remove ...' },
+  { name: 'atime-watch', group: 'extra', desc: 'Poll atime to detect silent reads (needs PIN) [extra]', usage: 'ducgo atime-watch <dir> [--interval 60] [--duration 0]' },
+  { name: 'trap-fingerprint-check', group: 'extra', desc: 'Check own honey banner for giveaways (needs PIN) [extra]', usage: 'ducgo trap-fingerprint-check <port>' },
+  { name: 'events-decrypt', group: 'extra', desc: 'Decrypt events to a plaintext export (needs PIN) [extra]', usage: 'ducgo events-decrypt <file>' },
+  { name: 'geoip-load', group: 'extra', desc: 'Load an offline IPv4 range DB (needs PIN) [extra]', usage: 'ducgo geoip-load <file>' },
+  { name: 'geoip-clear', group: 'extra', desc: 'Clear the offline geo DB (needs PIN) [extra]', usage: 'ducgo geoip-clear' },
 ];
 export const EXTRA_BUILTIN_NAMES = EXTRA_BUILTINS.map((c) => c.name);
 export const HIDDEN_COMMANDS = ['__complete'];
@@ -229,10 +260,54 @@ function validatePluginShape(exp) {
   }
   return { ok: true, name: exp.name.trim(), version: typeof exp.version === 'string' ? exp.version : '', commands: exp.commands };
 }
+// Load a plugin file inside a node:vm sandbox exposing ONLY
+// {console, Math, JSON, URL, TextEncoder, TextDecoder, module, exports}.
+// NO require/process/fs/child_process/net. ESM `export default {...}`
+// is rewritten to CommonJS for the sandbox. Throws on require/process
+// usage, static imports, or invalid shape. vm is isolation-aid, NOT a
+// security boundary against determined malicious code (see README).
+export function loadPluginVmSource(filePath) {
+  const src = fs.readFileSync(filePath, 'utf8');
+  if (/^\s*import\s+[^;]+from\s+['"]/m.test(src) || /^\s*import\s*\(/m.test(src) || /^\s*import\s+['"]/m.test(src)) {
+    throw new Error('static import() not allowed in sandbox (use --unsafe for full-privilege plugins)');
+  }
+  let body = src.replace(/export\s+default\s+/g, 'module.exports = ');
+  // Reject obvious full-privilege globals at load time for a clear error.
+  // Runtime access is already blocked (not in context), this is guidance.
+  const sandbox = {
+    console,
+    Math,
+    JSON,
+    URL,
+    TextEncoder,
+    TextDecoder,
+    module: { exports: {} },
+    exports: {},
+  };
+  sandbox.exports = sandbox.module.exports;
+  const ctx = vm.createContext(sandbox);
+  const wrapped = `(function(module, exports, console, Math, JSON, URL, TextEncoder, TextDecoder) {\n${body}\n})`;
+  try {
+    const fn = new vm.Script(wrapped, { filename: path.basename(filePath) }).runInContext(ctx);
+    fn(sandbox.module, sandbox.exports, sandbox.console, sandbox.Math, sandbox.JSON, sandbox.URL, sandbox.TextEncoder, sandbox.TextDecoder);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/require is not defined|process is not defined|fs is not defined|child_process|import/i.test(msg)) {
+      throw new Error(`sandbox blocked privileged API (${msg.slice(0, 120)}) - use --unsafe for full-privilege plugins`);
+    }
+    throw e;
+  }
+  const exp = sandbox.module.exports;
+  return exp;
+}
+
 // Load plugins from <dataDir>/plugins. Isolates failures: broken files warn and are skipped.
 // Returns { plugins: [{ id, file, sha256, enabled, name, version, commands, broken, warning }], cmdMap: Map(cmdName -> { pluginId, def }) }.
 // Only ENABLED plugins contribute to cmdMap. Collisions with built-ins/extras or
 // earlier plugin commands are skipped with a warning.
+// Sandboxing: enabled plugins load inside node:vm (limited globals). If vm
+// fails (e.g. uses require), fall back to full-privilege import ONLY when the
+// per-plugin `unsafe` flag is set via `plugin-enable --unsafe` (loud warning).
 export async function loadPlugins(dataDir) {
   const cfg = loadConfig(dataDir);
   const dir = getPluginDir(dataDir);
@@ -249,18 +324,36 @@ export async function loadPlugins(dataDir) {
     const stored = cfg.plugins[id] || cfg.plugins[f] || null;
     const enabled = stored ? !!stored.enabled : false;
     const storedSha = stored ? (stored.sha256 || '') : '';
+    const unsafeAllowed = stored ? stored.unsafe === true : false;
     let exp = null;
-    try {
-      let mtime = 0;
-      try { mtime = fs.statSync(fp).mtimeMs; } catch { mtime = 0; }
-      const url = pathToFileURL(fp).href + `?t=${Math.floor(mtime)}`;
-      const mod = await import(url);
-      exp = mod && mod.default !== undefined ? mod.default : mod;
-    } catch (e) {
-      const msg = `Plugin "${f}" failed to load (${String((e && e.message) || e).slice(0, 160)}) - skipped.`;
-      ui.warn(msg);
-      plugins.push({ id, file: f, sha256: liveSha || storedSha, enabled, name: (stored && stored.name) || id, version: (stored && stored.version) || '', commands: [], broken: true, warning: msg });
-      continue;
+    // Unsafe + enabled: full-privilege import directly (no vm), loud warning.
+    if (unsafeAllowed && enabled) {
+      ui.warn(`Plugin "${f}" running with FULL privileges (--unsafe, no sandbox). Only use for plugins you fully trust.`);
+      try {
+        let mtime = 0;
+        try { mtime = fs.statSync(fp).mtimeMs; } catch { mtime = 0; }
+        const url = pathToFileURL(fp).href + `?t=${Math.floor(mtime)}`;
+        const mod = await import(url);
+        exp = mod && mod.default !== undefined ? mod.default : mod;
+      } catch (e2) {
+        const msg = `Plugin "${f}" failed to load even with --unsafe (${String((e2 && e2.message) || e2).slice(0, 160)}) - skipped.`;
+        ui.warn(msg);
+        plugins.push({ id, file: f, sha256: liveSha || storedSha, enabled, name: (stored && stored.name) || id, version: (stored && stored.version) || '', commands: [], broken: true, warning: msg });
+        continue;
+      }
+    } else {
+      try {
+        exp = loadPluginVmSource(fp);
+      } catch (e) {
+        const vmError = String((e && e.message) || e).slice(0, 200);
+        const hint = /sandbox blocked|not allowed in sandbox|require|process|import/i.test(vmError)
+          ? ' (uses require/process/import - blocked in sandbox; enable with `plugin-enable --unsafe` for full privileges, only if you trust it)'
+          : '';
+        const msg = `Plugin "${f}" failed to load in sandbox (${vmError.slice(0, 160)})${hint} - skipped.`;
+        ui.warn(msg);
+        plugins.push({ id, file: f, sha256: liveSha || storedSha, enabled, name: (stored && stored.name) || id, version: (stored && stored.version) || '', commands: [], broken: true, warning: msg });
+        continue;
+      }
     }
     const v = validatePluginShape(exp);
     if (!v.ok) {
@@ -516,24 +609,80 @@ function replPromptHidden(query) {
 }
 
 // ---------- auth gate (duress handled here for EVERY auth prompt) ----------
-function handleDuress(dataDir) {
+// Lockout: escalating delays (3 fails 5s, 5 fails 60s, 10 fails 15min lock
+// with {failCount, lockUntil} in auth.json). Successful normal OR duress
+// resets. Every failure appends auth_failure (no PIN, source command).
+// Duress semantics UNCHANGED: all-clear + silent log, extras invisible.
+function handleDuress(dataDir, duressPin) {
   try {
+    // Duress appends with duress-derived key (k:'d'); normal key unknown here.
+    try {
+      const cfg = loadConfig(dataDir);
+      if (cfg.encryption === 'on' && cfg.encSalt && duressPin) {
+        unlockEvents(dataDir, duressPin, 'duress');
+      }
+    } catch { /* best-effort */ }
     appendEvent(dataDir, makeDuressEvent());
   } catch { /* silent log is best-effort */ }
+  try { resetLockState(dataDir); } catch { /* ignore */ }
   console.log(DURESS_MESSAGE);
   replSawDuress = true; // only read inside the REPL; one-shot behavior unchanged
   process.exit(0);
 }
-async function requireAuth(dataDir) {
+function lockSourceLabel(explicit) {
+  if (explicit && String(explicit).trim()) return String(explicit).trim().slice(0, 80);
+  try {
+    const a = process.argv[2];
+    if (a && !String(a).startsWith('-')) return String(a).slice(0, 80);
+  } catch { /* ignore */ }
+  return 'unknown';
+}
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+async function requireAuth(dataDir, sourceCmd) {
   if (!isSetup(dataDir)) {
     console.error('Not set up yet. Run "ducgo setup" first.');
     process.exit(1);
   }
+  const src = lockSourceLabel(sourceCmd);
+  // Pre-check lock (no prompt when locked).
+  try {
+    const st = loadLockState(dataDir);
+    const now = Date.now();
+    if (isLockedAt(st.lockUntil, now)) {
+      const remainMin = Math.max(1, Math.ceil((st.lockUntil - now) / 60000));
+      try {
+        appendEvent(dataDir, makeEvent('auth_failure', 'auth', '127.0.0.1', `Locked PIN attempt for "${src}" (failCount ${st.failCount}, locked ${remainMin}min left)`, 'medium'));
+      } catch { /* best-effort */ }
+      console.error(`Locked - too many failed attempts. Try again in ~${remainMin}min.`);
+      process.exit(1);
+    }
+  } catch { /* proceed to prompt on helper failure */ }
   const pin = await promptHidden('Enter PIN: ');
   const r = verifyPin(dataDir, pin || '');
-  if (r === 'normal') return;
-  if (r === 'duress') handleDuress(dataDir);
-  console.error('Incorrect PIN.');
+  if (r === 'normal') {
+    try { resetLockState(dataDir); } catch { /* ignore */ }
+    try { unlockEvents(dataDir, pin || '', 'normal'); } catch { /* best-effort */ }
+    return pin || '';
+  }
+  if (r === 'duress') handleDuress(dataDir, pin || '');
+  // Failure: increment, log auth_failure (no PIN content), sleep delay.
+  let failCount = 0;
+  try {
+    const rec = recordAuthFailure(dataDir, Date.now());
+    failCount = rec.failCount;
+  } catch { failCount = 0; }
+  try {
+    appendEvent(dataDir, makeEvent('auth_failure', 'auth', '127.0.0.1', `Failed PIN attempt for "${src}" (failCount ${failCount})`, 'medium'));
+  } catch { /* best-effort */ }
+  const delay = getLockoutDelay(failCount);
+  if (delay > 0 && !process.env.DUC_NO_LOCK_SLEEP) {
+    try { await sleepMs(delay); } catch { /* ignore */ }
+  }
+  if (failCount >= 10) {
+    console.error('Locked - too many failed attempts. Try again in ~15min.');
+  } else {
+    console.error('Incorrect PIN.');
+  }
   process.exit(1);
 }
 
@@ -763,39 +912,67 @@ async function cmdSetup(rest) {
   }
   const r = setupPins(dataDir, pin, duress);
   if (!r.ok) fail(r.error || 'Setup failed.');
+  try {
+    setupEventEncryption(dataDir, pin, duress);
+  } catch { /* encryption best-effort; plaintext fallback */ }
   ui.ok(`Setup complete. Data directory: ${dataDir}`);
-  ui.info('Run "ducgo start" to arm the trap mesh.');
+  ui.info('Event log encryption ON (AES-256-GCM, PIN-derived key). Run "ducgo start" to arm the trap mesh.');
 }
 async function cmdLoginTest(rest) {
   if (wantsHelp(rest)) return cmdUsage('login-test');
   const dataDir = getDataDir();
   if (!isSetup(dataDir)) fail('Not set up yet. Run "ducgo setup" first.');
+  try {
+    const st = loadLockState(dataDir);
+    if (isLockedAt(st.lockUntil, Date.now())) {
+      console.error('Locked - too many failed attempts. Try again later.');
+      process.exit(1);
+    }
+  } catch { /* proceed */ }
   const pin = await promptHidden('Enter PIN: ');
   const r = verifyPin(dataDir, pin || '');
-  if (r === 'duress') handleDuress(dataDir);
-  if (r === 'normal') { ui.ok('PIN accepted.'); return; }
+  if (r === 'duress') handleDuress(dataDir, pin || '');
+  if (r === 'normal') {
+    try { resetLockState(dataDir); } catch { /* ignore */ }
+    try { unlockEvents(dataDir, pin || '', 'normal'); } catch { /* ignore */ }
+    ui.ok('PIN accepted.'); return;
+  }
+  try {
+    const rec = recordAuthFailure(dataDir, Date.now());
+    try { appendEvent(dataDir, makeEvent('auth_failure', 'auth', '127.0.0.1', `Failed PIN attempt for "login-test" (failCount ${rec.failCount})`, 'medium')); } catch { /* ignore */ }
+    const delay = getLockoutDelay(rec.failCount);
+    if (delay > 0 && !process.env.DUC_NO_LOCK_SLEEP) await sleepMs(delay);
+  } catch { /* ignore */ }
   fail('Incorrect PIN.');
 }
 async function cmdChangePin(rest) {
   if (wantsHelp(rest)) return cmdUsage('change-pin');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'change-pin');
   const np = await promptHidden('New access PIN (min 6 chars): ');
   const np2 = await promptHidden('Confirm new access PIN: ');
   if (np !== np2) fail('PINs do not match.');
   const r = changeAccessPin(dataDir, np);
   if (!r.ok) fail(r.error || 'Change failed.');
+  try {
+    rewrapAfterNormalPinChange(dataDir, np);
+    try { reencryptFileWithSession(dataDir); } catch { /* best-effort */ }
+  } catch { /* encryption best-effort */ }
   ui.ok('Access PIN changed.');
 }
 async function cmdChangeDuress(rest) {
   if (wantsHelp(rest)) return cmdUsage('change-duress');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'change-duress');
   const np = await promptHidden('New duress PIN (min 6 chars, must differ): ');
   const np2 = await promptHidden('Confirm new duress PIN: ');
   if (np !== np2) fail('Duress PINs do not match.');
   const r = changeDuressPin(dataDir, np);
   if (!r.ok) fail(r.error || 'Change failed.');
+  try {
+    rewrapAfterDuressPinChange(dataDir, np);
+    try { reencryptFileWithSession(dataDir); } catch { /* best-effort */ }
+  } catch { /* encryption best-effort */ }
   ui.ok('Duress PIN changed.');
 }
 async function cmdLockStatus(rest) {
@@ -858,10 +1035,11 @@ async function cmdStart(rest) {
   const servers = [];
   for (const port of enabledPorts) {
     try {
-      const srv = await startHoneyTcp(port, emit);
+      const stealth = (liveCfg.stealthBanners || {})[String(port)] || null;
+      const srv = await startHoneyTcp(port, emit, stealth ? { stealth } : {});
       servers.push(srv);
       const custom = liveCfg.banners[String(port)];
-      ui.ok(`Listening: honey TCP :${port} (LAN-visible by design)${custom ? ` [custom banner: ${custom.slice(0, 60)}]` : ''}`);
+      ui.ok(`Listening: honey TCP :${port} (LAN-visible by design)${stealth ? ` [stealth ${stealth} banner (imitation)]` : ''}${custom ? ` [custom banner: ${custom.slice(0, 60)}]` : ''}`);
     } catch (err) {
       emit(makeEvent('system', `honey-tcp:${port}`, '127.0.0.1', `Port ${port} unavailable (${(err && err.code) || (err && err.message) || err}) - continuing without it`, 'medium'));
     }
@@ -951,29 +1129,53 @@ async function cmdEngineCheck(rest) {
 async function cmdTrapList(rest) {
   if (wantsHelp(rest)) return cmdUsage('trap-list');
   const cfg = loadConfig(getDataDir());
-  const rows = cfg.ports.map((p) => [`honey-tcp:${p}`, cfg.disabled.includes(`honey-tcp:${p}`) ? 'disabled' : 'enabled', cfg.banners[String(p)] || defaultBannerFor(p)]);
+  const rows = cfg.ports.map((p) => {
+    const stealth = (cfg.stealthBanners || {})[String(p)];
+    const label = stealth ? `stealth:${stealth}` : (cfg.banners[String(p)] || defaultBannerFor(p));
+    return [`honey-tcp:${p}`, cfg.disabled.includes(`honey-tcp:${p}`) ? 'disabled' : 'enabled', label];
+  });
   rows.push(['honey-http', 'enabled', cfg.httpTitle || 'Admin Login']);
   console.log(ui.table(['TRAP', 'STATE', 'BANNER / TITLE'], rows));
 }
 async function cmdTrapAdd(rest) {
-  if (wantsHelp(rest)) return cmdUsage('trap-add');
+  if (wantsHelp(rest)) { console.log('Usage: ducgo trap-add <port> [--stealth-banner ssh|ftp|telnet]'); return; }
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'trap-add');
   const raw = firstPositional(rest);
-  if (!raw) fail('Usage: ducgo trap-add <port>');
+  if (!raw) fail('Usage: ducgo trap-add <port> [--stealth-banner ssh|ftp|telnet]');
   const n = Number(String(raw).trim());
   if (!Number.isInteger(n) || n < 1 || n > 65535) fail(`Invalid port: "${raw}" (must be 1-65535)`);
+  const stealthRaw = takeFlagValue(rest, ['--stealth-banner']);
+  let stealth = null;
+  if (stealthRaw !== null) {
+    stealth = String(stealthRaw).toLowerCase();
+    if (!['ssh', 'ftp', 'telnet'].includes(stealth)) fail('--stealth-banner must be ssh|ftp|telnet');
+  }
   const cfg = loadConfig(dataDir);
-  if (cfg.ports.includes(n)) fail(`Port ${n} is already a trap.`);
+  if (cfg.ports.includes(n)) {
+    // Port exists: allow setting stealth on existing trap.
+    if (stealth) {
+      if (!cfg.stealthBanners) cfg.stealthBanners = {};
+      cfg.stealthBanners[String(n)] = stealth;
+      saveConfig(dataDir, cfg);
+      ui.ok(`Trap :${n} stealth banner set to ${stealth} (imitation, served on next start)`);
+      return;
+    }
+    fail(`Port ${n} is already a trap.`);
+  }
   if (cfg.ports.length >= 20) fail('Too many traps (max 20).');
   cfg.ports.push(n);
+  if (stealth) {
+    if (!cfg.stealthBanners) cfg.stealthBanners = {};
+    cfg.stealthBanners[String(n)] = stealth;
+  }
   saveConfig(dataDir, cfg);
-  ui.ok(`Trap added: honey-tcp:${n}`);
+  ui.ok(`Trap added: honey-tcp:${n}${stealth ? ` with stealth ${stealth} banner (imitation)` : ''}`);
 }
 async function cmdTrapRemove(rest) {
   if (wantsHelp(rest)) return cmdUsage('trap-remove');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'trap-remove');
   const raw = firstPositional(rest);
   if (!raw) fail('Usage: ducgo trap-remove <port>');
   const n = Number(String(raw).trim());
@@ -982,6 +1184,7 @@ async function cmdTrapRemove(rest) {
   cfg.ports = cfg.ports.filter((p) => p !== n);
   if (cfg.ports.length === 0) cfg.ports = [...DEFAULT_PORTS];
   cfg.disabled = cfg.disabled.filter((d) => d !== `honey-tcp:${n}`);
+  if (cfg.stealthBanners) delete cfg.stealthBanners[String(n)];
   saveConfig(dataDir, cfg);
   ui.ok(`Trap removed: ${n}`);
 }
@@ -1325,26 +1528,52 @@ async function cmdEventsStats(rest) {
 }
 
 // ================= ATTACKERS =================
+// Geo + confidence columns appear ONLY when an offline DB is loaded
+// (`geoip-load`); otherwise output is unchanged. Confidence weights:
+// base 50, RFC1918/local -30, single touch +10, 3+ trap types +25,
+// canary token +20, capped 0-100 (see README + tips). No network calls ever.
+function enrichAttackerRows(dataDir, rows) {
+  const geo = loadGeoDbForDir(dataDir);
+  if (!geo.ok) return { rows, geoOn: false };
+  const out = rows.map((r) => {
+    const g = lookupGeoIp(r.ip, geo.db);
+    const traps = new Set((r.timeline || []).map((e) => String(e.trap || '')));
+    const hasCanary = (r.timeline || []).some((e) => String(e.detail || '').includes('MIRAGETOKEN') || String(e.trap || '').startsWith('canary'));
+    const conf = geoConfidence(r.ip, r.touches, traps.size, hasCanary);
+    return { ...r, geo: g ? `${g.country}${g.city ? '/' + g.city : ''}` : '-', confidence: conf.score, confReasons: conf.reasons };
+  });
+  return { rows: out, geoOn: true };
+}
 async function cmdAttackers(rest) {
   if (wantsHelp(rest)) return cmdUsage('attackers');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
-  const rows = groupByIp(readEvents(dataDir));
-  if (rows.length === 0) { ui.dim('No attacker touches recorded.'); return; }
-  console.log(ui.table(['IP', 'TOUCHES', 'FIRST SEEN', 'LAST SEEN', 'TOP TRAP'], rows.map((r) => [r.ip, String(r.touches), String(r.first), String(r.last), r.top])));
+  await requireAuth(dataDir, 'attackers');
+  const base = groupByIp(readEvents(dataDir));
+  if (base.length === 0) { ui.dim('No attacker touches recorded.'); return; }
+  const { rows, geoOn } = enrichAttackerRows(dataDir, base);
+  if (!geoOn) {
+    console.log(ui.table(['IP', 'TOUCHES', 'FIRST SEEN', 'LAST SEEN', 'TOP TRAP'], rows.map((r) => [r.ip, String(r.touches), String(r.first), String(r.last), r.top])));
+  } else {
+    console.log(ui.table(['IP', 'TOUCHES', 'FIRST SEEN', 'LAST SEEN', 'TOP TRAP', 'GEO', 'CONF'], rows.map((r) => [r.ip, String(r.touches), String(r.first), String(r.last), r.top, r.geo, String(r.confidence)])));
+    ui.dim('Geo: offline DB only (no lookups). Conf: base 50, local -30, single +10, 3+ traps +25, canary +20 (0-100).');
+  }
   ui.dim(`${rows.length} unique IP(s). Naive IP grouping - not attribution.`);
 }
 async function cmdAttackerShow(rest) {
   if (wantsHelp(rest)) return cmdUsage('attacker-show');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'attacker-show');
   const ip = firstPositional(rest);
   if (!ip) fail('Usage: ducgo attacker-show <ip>');
   const rows = groupByIp(readEvents(dataDir));
   const g = rows.find((r) => r.ip === ip);
   if (!g) fail(`No touches from ${ip}`);
-  console.log(ui.box(`attacker ${ip}`, [`touches: ${g.touches}`, `first: ${g.first}`, `last: ${g.last}`, `top trap: ${g.top}`]));
-  console.log(ui.table(['TIME', 'TYPE', 'TRAP', 'DETAIL'], g.timeline.slice(-15).map((e) => [String(e.time), String(e.type), String(e.trap), String(e.detail).replace(/\s+/g, ' ').slice(0, 70)])));
+  const { rows: enriched, geoOn } = enrichAttackerRows(dataDir, [g]);
+  const e = enriched[0];
+  const boxLines = [`touches: ${g.touches}`, `first: ${g.first}`, `last: ${g.last}`, `top trap: ${g.top}`];
+  if (geoOn) boxLines.push(`geo: ${e.geo}`, `confidence: ${e.confidence}/100 (${e.confReasons.join('; ')})`);
+  console.log(ui.box(`attacker ${ip}`, boxLines));
+  console.log(ui.table(['TIME', 'TYPE', 'TRAP', 'DETAIL'], g.timeline.slice(-15).map((ev) => [String(ev.time), String(ev.type), String(ev.trap), String(ev.detail).replace(/\s+/g, ' ').slice(0, 70)])));
   const notes = getAttackerNotes(dataDir, ip)[ip] || [];
   if (notes.length > 0) console.log(ui.table(['NOTE TIME', 'NOTE'], notes.map((x) => [x.time, x.text])));
 }
@@ -1441,13 +1670,20 @@ async function cmdReportExport(rest) {
 }
 
 // ================= CONFIG =================
-const CONFIG_KEYS = ['ports', 'httpPort', 'httpTitle', 'watchDirs'];
+// No new commands for alerts/encryption: use existing config-set.
+// Keys: ports, httpPort, httpTitle, watchDirs (original) + encryption
+// (on|off), alerts (off|beep|file|both), alerts-file (path).
+// `encryption on` re-encrypts the current file with the current normal key;
+// `off` writes plaintext going forward (existing encrypted lines stay,
+// mixed files read transparently). geoipDb managed via geoip-load/clear.
+const CONFIG_KEYS = ['ports', 'httpPort', 'httpTitle', 'watchDirs', 'encryption', 'alerts', 'alerts-file'];
 async function cmdConfigSet(rest) {
-  if (wantsHelp(rest)) return cmdUsage('config-set');
+  if (wantsHelp(rest)) { console.log('Usage: ducgo config-set <key> <value>  (keys: ports, httpPort, httpTitle, watchDirs, encryption on|off, alerts off|beep|file|both, alerts-file <path>)'); return; }
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  const authedPin = await requireAuth(dataDir, 'config-set');
+  void authedPin;
   const pos = positionals(rest);
-  if (pos.length < 2) fail('Usage: ducgo config-set <key> <value>  (keys: ports, httpPort, httpTitle, watchDirs)');
+  if (pos.length < 2) fail('Usage: ducgo config-set <key> <value>  (keys: ports, httpPort, httpTitle, watchDirs, encryption, alerts, alerts-file)');
   const [key, ...valParts] = pos;
   const val = valParts.join(' ');
   if (!CONFIG_KEYS.includes(key)) fail(`Unknown key: ${key} (keys: ${CONFIG_KEYS.join(', ')})`);
@@ -1465,6 +1701,37 @@ async function cmdConfigSet(rest) {
     cfg.httpTitle = val.trim();
   } else if (key === 'watchDirs') {
     cfg.watchDirs = val.split(',').map((s) => s.trim()).filter(Boolean).map((s) => path.resolve(s));
+  } else if (key === 'encryption') {
+    const v = String(val).trim().toLowerCase();
+    if (!['on', 'off'].includes(v)) fail('encryption must be on|off');
+    if (v === 'on') {
+      if (!cfg.encSalt) ensureEncSalt(dataDir);
+      const fresh = loadConfig(dataDir);
+      cfg.encSalt = fresh.encSalt;
+      if (!cfg.encWrapped && fresh.encWrapped) cfg.encWrapped = fresh.encWrapped;
+      cfg.encryption = 'on';
+      saveConfig(dataDir, cfg);
+      // Re-derive session (unlock happened when OFF, so session is empty).
+      try { if (authedPin) unlockEvents(dataDir, authedPin, 'normal'); } catch { /* ignore */ }
+      try {
+        const rr = reencryptFileWithSession(dataDir);
+        if (!rr.ok) ui.warn(`Encryption ON, but re-encrypt deferred (${rr.error || 'no session'}) - new events will encrypt going forward.`);
+        else ui.ok(`Encryption ON - re-encrypted ${rr.total} event(s). Mixed files read transparently.`);
+      } catch (e) {
+        ui.warn(`Encryption ON (re-encrypt best-effort: ${String((e && e.message) || e).slice(0, 120)})`);
+      }
+      ui.ok(`config ${key} updated.`);
+      return;
+    } else {
+      cfg.encryption = 'off';
+    }
+  } else if (key === 'alerts') {
+    const v = String(val).trim().toLowerCase();
+    if (!['off', 'beep', 'file', 'both'].includes(v)) fail('alerts must be off|beep|file|both');
+    cfg.alerts = v;
+  } else if (key === 'alerts-file') {
+    if (!val.trim() || val.length > 500) fail('alerts-file must be 1-500 chars');
+    cfg['alerts-file'] = val.trim();
   }
   saveConfig(dataDir, cfg);
   ui.ok(`config ${key} updated.`);
@@ -1490,9 +1757,10 @@ async function cmdConfigList(rest) {
 async function cmdConfigReset(rest) {
   if (wantsHelp(rest)) return cmdUsage('config-reset');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
-  saveConfig(dataDir, { ports: [...DEFAULT_PORTS], httpPort: DEFAULT_HTTP_PORT, watchDirs: [], disabled: [], banners: {}, httpTitle: 'Admin Login', notes: {}, plugins: {}, aliases: {}, macros: {} });
-  ui.ok('Config reset to defaults.');
+  await requireAuth(dataDir, 'config-reset');
+  const cur = loadConfig(dataDir);
+  saveConfig(dataDir, { ports: [...DEFAULT_PORTS], httpPort: DEFAULT_HTTP_PORT, watchDirs: [], disabled: [], banners: {}, stealthBanners: {}, httpTitle: 'Admin Login', notes: {}, plugins: cur.plugins || {}, aliases: cur.aliases || {}, macros: cur.macros || {}, encryption: cur.encryption || 'off', encSalt: cur.encSalt || '', encWrapped: cur.encWrapped || null, alerts: 'off', 'alerts-file': '', geoipDb: cur.geoipDb || '' });
+  ui.ok('Config reset to defaults (plugins/aliases/macros/encryption salt kept).');
 }
 async function cmdDataDir(rest) {
   if (wantsHelp(rest)) return cmdUsage('data-dir');
@@ -1532,7 +1800,14 @@ async function cmdConfigImport(rest) {
   if (Array.isArray(j.watchDirs)) next.watchDirs = [...new Set(j.watchDirs.map(String))];
   if (Array.isArray(j.disabled)) next.disabled = [...new Set(j.disabled.map(String))];
   if (j.banners && typeof j.banners === 'object') next.banners = j.banners;
+  if (j.stealthBanners && typeof j.stealthBanners === 'object') next.stealthBanners = j.stealthBanners;
   if (typeof j.httpTitle === 'string' && j.httpTitle.length <= 120) next.httpTitle = j.httpTitle;
+  if (typeof j.encryption === 'string' && ['on', 'off'].includes(j.encryption)) next.encryption = j.encryption;
+  if (typeof j.encSalt === 'string' && /^[0-9a-f]{32}$/i.test(j.encSalt)) next.encSalt = j.encSalt.toLowerCase();
+  if (j.encWrapped && typeof j.encWrapped === 'object') next.encWrapped = j.encWrapped;
+  if (typeof j.alerts === 'string' && ['off', 'beep', 'file', 'both'].includes(j.alerts)) next.alerts = j.alerts;
+  if (typeof j['alerts-file'] === 'string') next['alerts-file'] = String(j['alerts-file']).slice(0, 500);
+  if (typeof j.geoipDb === 'string') next.geoipDb = String(j.geoipDb).slice(0, 500);
   if (j.plugins && typeof j.plugins === 'object' && !Array.isArray(j.plugins)) next.plugins = j.plugins;
   if (j.aliases && typeof j.aliases === 'object' && !Array.isArray(j.aliases)) next.aliases = j.aliases;
   if (j.macros && typeof j.macros === 'object' && !Array.isArray(j.macros)) next.macros = j.macros;
@@ -1548,10 +1823,13 @@ async function cmdConfigImport(rest) {
 // skipped with a warning. Broken plugins warn and are skipped. Trust model:
 // plugin-add copies the file, prints SHA-256, DISABLED by default + warning.
 // Only enable plugins you trust - they run as your user with your privileges.
+// Sandbox: enabled plugins load in node:vm with ONLY {ctx, console, Math,
+// JSON, URL, TextEncoder/Decoder} (no require/process/fs). vm is
+// isolation-aid, NOT a security boundary against determined malicious code.
 async function cmdPluginAdd(rest) {
   if (wantsHelp(rest)) return cmdUsage('plugin-add');
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'plugin-add');
   const file = firstPositional(rest);
   if (!file) fail('Usage: ducgo plugin-add <file>');
   const src = path.resolve(file);
@@ -1568,40 +1846,66 @@ async function cmdPluginAdd(rest) {
   const id = path.basename(base, '.js');
   const cfg = loadConfig(dataDir);
   if (!cfg.plugins) cfg.plugins = {};
-  // Try to read metadata now (best-effort) for list/show even while disabled.
+  // Try to read metadata now (best-effort, sandboxed) for list/show even while disabled.
   let pname = id; let pver = ''; let pcmds = [];
   try {
-    const url = pathToFileURL(dest).href + `?t=${Date.now()}`;
-    const mod = await import(url);
-    const exp = mod && mod.default !== undefined ? mod.default : mod;
+    const exp = loadPluginVmSource(dest);
     const v = validatePluginShape(exp);
     if (v.ok) { pname = v.name; pver = v.version; pcmds = v.commands.map((c) => c.name); }
     else ui.warn(`Plugin added but invalid (${v.error}) - fix or remove it.`);
   } catch (e) {
-    ui.warn(`Plugin added but failed to load (${String((e && e.message) || e).slice(0, 160)}) - fix or remove it.`);
+    // Fall back to full import for metadata only (still disabled, no execution).
+    try {
+      const url = pathToFileURL(dest).href + `?t=${Date.now()}`;
+      const mod = await import(url);
+      const exp2 = mod && mod.default !== undefined ? mod.default : mod;
+      const v2 = validatePluginShape(exp2);
+      if (v2.ok) { pname = v2.name; pver = v2.version; pcmds = v2.commands.map((c) => c.name); }
+      ui.warn(`Plugin needs full privileges (uses require/process?) - enable only with --unsafe if you trust it. (${String((e && e.message) || e).slice(0, 120)})`);
+    } catch {
+      ui.warn(`Plugin added but failed to load (${String((e && e.message) || e).slice(0, 160)}) - fix or remove it.`);
+    }
   }
   cfg.plugins[id] = { enabled: false, file: base, sha256: sha, name: pname, version: pver, commands: pcmds };
   saveConfig(dataDir, cfg);
   console.log(`SHA-256: ${sha}`);
-  ui.warn(`Plugin "${base}" added DISABLED by default. Only enable plugins you trust - they run as your user. It CANNOT hook the trap engine or auth; it can only add commands.`);
-  ui.info(`Run "ducgo plugin-enable ${id}" to enable, "ducgo plugin-list" to review.`);
+  ui.warn(`WARNING: plugins run with FULL privileges as your user (can read files, run commands, access network). Plugin "${base}" added DISABLED by default. Only enable plugins you fully trust - review the source first. It CANNOT hook the trap engine or auth; it can only add commands.`);
+  ui.info(`Run "ducgo plugin-enable ${id}" (requires typing CONFIRM) to enable, "ducgo plugin-list" to review.`);
 }
 async function cmdPluginEnable(rest) {
-  if (wantsHelp(rest)) return cmdUsage('plugin-enable');
+  if (wantsHelp(rest)) { console.log('Usage: ducgo plugin-enable <id> [--yes-confirm] [--unsafe]'); return; }
   const dataDir = getDataDir();
-  await requireAuth(dataDir);
+  await requireAuth(dataDir, 'plugin-enable');
   const id = firstPositional(rest);
-  if (!id) fail('Usage: ducgo plugin-enable <id>');
+  if (!id) fail('Usage: ducgo plugin-enable <id> [--yes-confirm] [--unsafe]');
+  const yesConfirm = hasFlag(rest, ['--yes-confirm']);
+  const wantUnsafe = hasFlag(rest, ['--unsafe']);
   const cfg = loadConfig(dataDir);
   const key = resolvePluginId(cfg, id);
   if (!key) fail(`No such plugin: ${id}`);
+  if (!yesConfirm) {
+    const ans = await promptLine(`Type CONFIRM to enable plugin "${key}" with FULL privileges (or Ctrl+C to abort): `);
+    if (String(ans).trim() !== 'CONFIRM') fail('Enable aborted (CONFIRM not typed).');
+  } else {
+    ui.warn('WARNING: --yes-confirm skips the interactive CONFIRM gate (scripting mode). Only use this for plugins you fully trust.');
+  }
+  if (wantUnsafe) {
+    ui.warn(`WARNING: --unsafe enables FULL-PRIVILEGE fallback for "${key}" (no vm sandbox: require/process/fs allowed). Only use for plugins you fully trust. This is recorded.`);
+    cfg.plugins[key].unsafe = true;
+  }
   cfg.plugins[key].enabled = true;
-  // Refresh stored metadata on enable (best-effort).
+  // Refresh stored metadata on enable (sandbox first, unsafe fallback).
   try {
     const fp = path.join(getPluginDir(dataDir), cfg.plugins[key].file);
-    const url = pathToFileURL(fp).href + `?t=${Date.now()}`;
-    const mod = await import(url);
-    const exp = mod && mod.default !== undefined ? mod.default : mod;
+    let exp = null;
+    try { exp = loadPluginVmSource(fp); }
+    catch (eVm) {
+      if (cfg.plugins[key].unsafe) {
+        const url = pathToFileURL(fp).href + `?t=${Date.now()}`;
+        const mod = await import(url);
+        exp = mod && mod.default !== undefined ? mod.default : mod;
+      } else throw eVm;
+    }
     const v = validatePluginShape(exp);
     if (v.ok) { cfg.plugins[key].name = v.name; cfg.plugins[key].version = v.version; cfg.plugins[key].commands = v.commands.map((c) => c.name); try { cfg.plugins[key].sha256 = sha256File(fp); } catch { /* keep */ } }
   } catch { /* keep stored metadata */ }
@@ -2004,11 +2308,23 @@ async function cmdDoctor(rest) {
   const be = sniff.captureBackend();
   checks.push(['capture backend', be.available ? `PASS (${be.kind}${be.exe ? ` @ ${be.exe}` : ''})` : `MISSING - ${be.installHint}`]);
   checks.push(['capture privilege', sniff.isAdmin() ? 'YES (elevated/root)' : 'no (capture needs elevation: Administrator on Windows, sudo on Linux/macOS)']);
+  try {
+    const probe = sniff.probeCaptureTool();
+    checks.push([`probe ${probe.tool}`, probe.ok ? 'PASS' : `FAIL (${probe.problem} - fix: ${probe.fix})`]);
+  } catch { /* best-effort */ }
+  try {
+    for (const c of sentinel.capabilityReport()) {
+      checks.push([`probe ${c.tool}`, c.ok ? 'PASS' : `FAIL (${c.problem} - fix: ${c.fix})`]);
+    }
+  } catch { /* best-effort */ }
   try { ensureDataDir(dataDir); fs.accessSync(dataDir, fs.constants.W_OK); checks.push(['data dir writable', `PASS (${dataDir})`]); }
   catch (e) { checks.push(['data dir writable', `FAIL (${e.message})`]); }
   checks.push(['auth setup', isSetup(dataDir) ? 'PASS' : 'NOT SET UP (run ducgo setup)']);
   const cfg = loadConfig(dataDir);
   checks.push(['config valid', Array.isArray(cfg.ports) && cfg.ports.length > 0 ? `PASS (${cfg.ports.length} traps)` : 'FAIL']);
+  checks.push(['event encryption', cfg.encryption === 'on' ? `ON (salt ${String(cfg.encSalt || '').slice(0, 8)}..)` : 'OFF (plaintext going forward; mixed files read)']);
+  checks.push(['alerts', `${cfg.alerts || 'off'} -> ${alertsPath(dataDir, cfg)}`]);
+  checks.push(['geo DB', cfg.geoipDb ? `loaded (${cfg.geoipDb})` : 'none (attackers unchanged)']);
   for (const p of cfg.ports.slice(0, 5)) checks.push([`port :${p} free`, (await checkPortFree(p)) ? 'yes' : 'IN USE']);
   console.log(ui.box('doctor', [`ducgo v${VERSION}`, `data dir: ${dataDir}`]));
   console.log(ui.table(['CHECK', 'RESULT'], checks));
@@ -2032,8 +2348,9 @@ async function cmdAbout(rest) {
   maybeBanner();
   console.log('');
   console.log(ui.box('about ducgo', ['passive deception tripwires: honey TCP + honey HTTP + canary files', '100% passive/defensive - only listens locally, never scans or attacks', 'English only. CLI only. Zero runtime dependencies (Node stdlib only).']));
-  console.log(ui.dim('Limits: fs.watch sees modify/rename/delete only (NOT silent reads); TCP ports are LAN-visible by design;'));
-  console.log(ui.dim('no encryption-at-rest beyond OS permissions; attacker table is naive IP grouping; duress hides the view, not the install.'));
+  console.log(ui.dim('Limits: fs.watch sees modify/rename/delete only (NOT silent reads) - atime-watch complements it (polls atime, not a replacement; noatime/relatime disables atime); TCP ports are LAN-visible by design;'));
+  console.log(ui.dim('event log encrypted at rest (AES-256-GCM, PIN-derived; mixed plaintext+encrypted reads transparently); attacker table is naive IP grouping + offline geo/confidence heuristics; duress hides the view, not the install.'));
+  console.log(ui.dim('Alerting is local-only (beep/file, no email/SMS/webhooks - those belong in optional plugins); plugins run sandboxed in node:vm (isolation-aid, not a security boundary).'));
 }
 async function cmdBackup(rest) {
   if (wantsHelp(rest)) return cmdUsage('backup');
@@ -2105,7 +2422,11 @@ async function cmdUptime(rest) {
 }
 async function cmdTips(rest) {
   if (wantsHelp(rest)) return cmdUsage('tips');
-  console.log(ui.box('tips', ['1. Run "ducgo doctor" after setup to verify ports + data dir', '2. Deploy canaries where they look natural (docs, backups)', '3. "ducgo start" is foreground only - keep the window open', '4. Review with "ducgo events" and "ducgo top-attackers"', '5. Test duress safely with a scratch MIRAGENET_DIR first']));
+  console.log(ui.box('tips', ['1. Run "ducgo doctor" after setup to verify ports + data dir', '2. Deploy canaries where they look natural (docs, backups)', '3. "ducgo start" is foreground only - keep the window open', '4. Review with "ducgo events" and "ducgo top-attackers"', '5. Test duress safely with a scratch MIRAGENET_DIR first',
+    '6. atime-watch complements fs.watch (silent reads); noatime/relatime disables atime - check `mount | grep noatime`',
+    '7. Alerting is local-only (config-set alerts beep|file|both); email/SMS/webhooks belong in optional plugins, not core',
+    '8. Geo confidence weights: base 50, local -30, single +10, 3+ traps +25, canary +20 (0-100, offline only)',
+    '9. Plugins load in node:vm (only ctx/console/Math/JSON/URL/Text codecs); vm is isolation-aid, not a boundary - review source, use --unsafe only if you trust it']));
 }
 async function cmdLicense(rest) {
   if (wantsHelp(rest)) return cmdUsage('license');
@@ -2302,8 +2623,14 @@ async function cmdOpenPorts(rest) {
     sentinel.scanLoopbackPorts('127.0.0.1', sentinel.COMMON_PORTS, 350),
     Promise.resolve(sentinel.getNetstatSnapshot()),
   ]);
-  if (!ns.ok) ui.warn(`netstat unavailable: ${ns.error} (showing self-scan only)`);
-  else if ((ns.listeners || []).length > 0) {
+  if (!ns.ok) {
+    ui.warn(`netstat unavailable: ${ns.error} (showing self-scan only)`);
+    try {
+      for (const c of sentinel.capabilityReport()) {
+        if (!c.ok) ui.warn(`capability probe: tool=${c.tool} problem=${c.problem} fix=${c.fix}`);
+      }
+    } catch { /* best-effort */ }
+  } else if ((ns.listeners || []).length > 0) {
     console.log(ui.table(['PROTO', 'LOCAL', 'PORT', 'PID'], ns.listeners.map((l) => [l.proto, l.local, String(l.port), String(l.pid || '-')])));
   } else console.log(ui.dim('No listeners reported by netstat.'));
   console.log(ui.box('open-ports (127.0.0.1 self-scan)', [open.length > 0 ? `open: ${open.join(', ')}` : 'open: none of the common ports']));
@@ -2536,12 +2863,15 @@ async function cmdSniffCheck(rest) {
   const plat = detectPlatform();
   const st = sniff.driverStatus();
   const be = sniff.captureBackend();
+  let probe = null;
+  try { probe = sniff.probeCaptureTool(); } catch { probe = null; }
   console.log(ui.box('sniff-check', [
     `platform: ${plat} (${os.platform()} ${os.arch()})`,
     'capture: Windows pktmon (inbox) / Linux tcpdump|dumpcap / macOS tcpdump (system)',
     'parse: local text analysis (flows, DNS, ARP, HTTP auth) on every OS',
     'privilege: required for capture only (Administrator on Windows, sudo/root on Linux/macOS) - parsing needs none',
     `active backend: ${be.kind}${be.exe ? ` (${be.exe})` : ''} - ${st.detail}`,
+    probe ? `probe ${probe.tool}: ${probe.ok ? 'PASS' : `FAIL (${probe.problem} - fix: ${probe.fix})`}` : 'probe: unavailable',
   ]));
   console.log(ui.table(['CHECK', 'RESULT'], [
     ['platform/backend', `${plat} / ${be.kind}`],
@@ -2796,6 +3126,165 @@ async function cmdSniffDns(rest) {
   ui.dim('FLAG ! = odd port or over-long name (possible tunneling - investigate).');
 }
 
+// ================= EXTRAS (never counted in the 92) =================
+// atime-watch: opt-in silent-read detection (complements fs.watch, NOT a
+// replacement). Polls atimeMs vs baseline in <dataDir>/atime-baseline.json,
+// reports ACCESSED vs MODIFIED. Limits: noatime/relatime mounts and some
+// filesystems disable atime (check `mount | grep noatime` on Linux).
+async function cmdAtimeWatch(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo atime-watch <dir> [--interval 60] [--duration 0]'); console.log('Complements fs.watch (which misses silent reads); NOT a replacement. Noatime/relatime mounts disable atime - check `mount | grep noatime`.'); return; }
+  const dataDir = getDataDir();
+  await requireAuth(dataDir, 'atime-watch');
+  const dir = firstPositional(rest);
+  if (!dir) fail('Usage: ducgo atime-watch <dir> [--interval 60] [--duration 0]');
+  const abs = path.resolve(dir);
+  try { if (!fs.statSync(abs).isDirectory()) fail(`Not a directory: ${dir}`); } catch { fail(`Cannot read: ${dir}`); }
+  let intervalSec = 60;
+  let durationSec = 0;
+  const ivRaw = takeFlagValue(rest, ['--interval']);
+  const duRaw = takeFlagValue(rest, ['--duration']);
+  if (ivRaw !== null) {
+    const n = Number(String(ivRaw).trim());
+    if (!Number.isInteger(n) || n < 1 || n > 300) fail('--interval must be 1-300 seconds');
+    intervalSec = n;
+  }
+  if (duRaw !== null) {
+    const n = Number(String(duRaw).trim());
+    if (!Number.isInteger(n) || n < 0 || n > 3600) fail('--duration must be 0-3600 seconds (0 = until Ctrl+C)');
+    durationSec = n;
+  }
+  let baseline = snapshotAtimeDir(abs, true);
+  ensureDataDir(dataDir);
+  try { saveAtimeBaseline(dataDir, baseline); } catch { /* best-effort */ }
+  ui.info(`Atime baseline for ${abs} (${Object.keys(baseline).length} file(s)). Polling every ${intervalSec}s${durationSec > 0 ? ` for ${durationSec}s` : ' until Ctrl+C'}. Complements fs.watch; noatime/relatime disables atime.`);
+  const startedAt = Date.now();
+  let cycle = 0;
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  if (!replActive) {
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  }
+  if (replActive && replRl) {
+    const rl = replRl;
+    if (!rl.closed) {
+      await new Promise((resolve) => {
+        const done = () => {
+          replStopResolver = null;
+          try { rl.removeListener('close', done); } catch { /* ignore */ }
+          stop();
+          resolve();
+        };
+        replStopResolver = done;
+        try { rl.once('close', done); } catch { /* ignore */ }
+      });
+    }
+    replStopResolver = null;
+  }
+  while (!stopped) {
+    cycle++;
+    const cur = snapshotAtimeDir(abs, true);
+    const diffs = diffAtime(baseline, cur);
+    if (diffs.length === 0) {
+      ui.ok(`[${cycle}] no atime/mtime changes (${new Date().toISOString()})`);
+    } else {
+      for (const d of diffs) {
+        if (d.kind === 'ACCESSED') ui.warn(`[${cycle}] ACCESSED (silent read): ${d.path}`);
+        else if (d.kind === 'MODIFIED') ui.warn(`[${cycle}] MODIFIED: ${d.path}`);
+        else ui.warn(`[${cycle}] ${d.kind}: ${d.path}`);
+        try {
+          appendEvent(dataDir, makeEvent('canary', `canary:${path.basename(d.path)}`, '127.0.0.1', `atime-watch ${d.kind}: ${d.path}`, d.kind === 'ACCESSED' || d.kind === 'MODIFIED' ? 'high' : 'medium', { dir: abs, file: d.path, kind: d.kind }));
+        } catch { /* best-effort */ }
+      }
+    }
+    baseline = cur;
+    try { saveAtimeBaseline(dataDir, baseline); } catch { /* ignore */ }
+    const elapsed = (Date.now() - startedAt) / 1000;
+    if (durationSec > 0 && elapsed >= durationSec) break;
+    const sleepMsTotal = Math.min(intervalSec * 1000, Math.max(0, durationSec > 0 ? (durationSec * 1000 - elapsed * 1000) : intervalSec * 1000));
+    if (sleepMsTotal <= 0) break;
+    const sliceEnd = Date.now() + sleepMsTotal;
+    while (Date.now() < sliceEnd) {
+      if (stopped) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (stopped) break;
+  }
+  console.log(ui.dim('Atime-watch stopped cleanly.'));
+}
+
+// trap-fingerprint-check: connect to own honey port, grab banner, verdict.
+async function cmdTrapFingerprintCheck(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo trap-fingerprint-check <port>'); return; }
+  const dataDir = getDataDir();
+  await requireAuth(dataDir, 'trap-fingerprint-check');
+  const raw = firstPositional(rest);
+  if (!raw) fail('Usage: ducgo trap-fingerprint-check <port>');
+  const port = Number(String(raw).trim());
+  if (!Number.isInteger(port) || port < 1 || port > 65535) fail(`Invalid port: "${raw}"`);
+  const banner = await new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const s = net.connect({ port, host: '127.0.0.1', timeout: 2500 }, () => {});
+      let data = '';
+      s.on('data', (d) => { data += String(d); });
+      s.on('error', () => finish(null));
+      s.setTimeout(2500, () => { try { s.destroy(); } catch { /* ignore */ } finish(data); });
+      setTimeout(() => { try { s.destroy(); } catch { /* ignore */ } finish(data || null); }, 2600);
+      s.on('close', () => finish(data || null));
+    } catch { finish(null); }
+  });
+  if (banner === null || banner === undefined) fail(`No banner from :${port} (is the trap running? start it with "ducgo start")`);
+  const { verdict, reasons } = fingerprintBanner(banner);
+  console.log(ui.box(`fingerprint :${port}`, [`banner: ${String(banner).replace(/\s+/g, ' ').slice(0, 160)}`, `verdict: ${verdict}`, ...reasons.map((r) => `- ${r}`)]));
+  if (verdict === 'PASS') { ui.ok(`PASS - banner looks realistic (${reasons.join('; ').slice(0, 200)})`); return; }
+  ui.warn(`WARN - ${reasons.join('; ').slice(0, 300)}`);
+  process.exit(1);
+}
+
+// events-decrypt: needs PIN, writes decrypted export + clear warning.
+async function cmdEventsDecrypt(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo events-decrypt <file>'); return; }
+  const dataDir = getDataDir();
+  const pin = await requireAuth(dataDir, 'events-decrypt');
+  void pin;
+  const file = firstPositional(rest);
+  if (!file) fail('Usage: ducgo events-decrypt <file>');
+  const out = path.resolve(file);
+  const events = readEvents(dataDir);
+  try { fs.writeFileSync(out, JSON.stringify(events, null, 2), 'utf8'); } catch (e) { fail(`Decrypt export failed: ${String((e && e.message) || e)}`); }
+  ui.warn(`SECURITY WARNING: ${out} is PLAINTEXT (decrypted event log). Delete after use, do not share or leave on disk.`);
+  ui.ok(`Decrypted ${events.length} event(s) to ${out}`);
+}
+
+// geoip-load / geoip-clear: offline IPv4 range DB, no network calls ever.
+async function cmdGeoipLoad(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo geoip-load <file>'); console.log('Accepts JSON {ranges:[{from,to,country,city?}]} IPv4 or CSV from,to,country,city. .mmdb needs external conversion (mmdb-dump: https://github.com/maxmind/mmdb-dump).'); return; }
+  const dataDir = getDataDir();
+  await requireAuth(dataDir, 'geoip-load');
+  const file = firstPositional(rest);
+  if (!file) fail('Usage: ducgo geoip-load <file>');
+  const abs = path.resolve(file);
+  try { fs.accessSync(abs, fs.constants.R_OK); } catch { fail(`Cannot read: ${file}`); }
+  if (/\.mmdb$/i.test(abs)) fail('.mmdb needs external conversion first (use mmdb-dump: https://github.com/maxmind/mmdb-dump to export JSON/CSV, then geoip-load the result)');
+  let db = null;
+  try { db = loadGeoDbFile(abs); } catch (e) { fail(`Invalid geo DB: ${String((e && e.message) || e).slice(0, 200)}`); }
+  const cfg = loadConfig(dataDir);
+  cfg.geoipDb = abs;
+  saveConfig(dataDir, cfg);
+  ui.ok(`Geo DB loaded: ${db.ranges.length} range(s) from ${abs} (offline only, no network calls)`);
+}
+async function cmdGeoipClear(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo geoip-clear'); return; }
+  const dataDir = getDataDir();
+  await requireAuth(dataDir, 'geoip-clear');
+  const cfg = loadConfig(dataDir);
+  cfg.geoipDb = '';
+  saveConfig(dataDir, cfg);
+  ui.ok('Geo DB cleared (attackers output back to unchanged).');
+}
+
 // Command dispatch table (exactly 92 entries). Shared by one-shot mode and
 // the interactive REPL so both modes run the SAME handler path.
 // NOTE: extras (plugin mgmt, completion, alias, macro, __complete) plus
@@ -2829,11 +3318,14 @@ const HANDLERS = {
   'sniff-check': cmdSniffCheck, sniff: cmdSniff, 'sniff-live': cmdSniffLive,
   'sniff-report': cmdSniffReport, 'sniff-top': cmdSniffTop, 'sniff-dns': cmdSniffDns,
 };
-// Extra dispatch table (NEVER counted in the 92). 9 visible extras + 1 hidden.
+// Extra dispatch table (NEVER counted in the 92). 14 visible extras + 1 hidden.
 const EXTRA_HANDLERS = {
   'plugin-add': cmdPluginAdd, 'plugin-enable': cmdPluginEnable, 'plugin-disable': cmdPluginDisable,
   'plugin-list': cmdPluginList, 'plugin-show': cmdPluginShow, 'plugin-remove': cmdPluginRemove,
-  completion: cmdCompletion, alias: cmdAlias, macro: cmdMacro, '__complete': cmdCompleteHidden,
+  completion: cmdCompletion, alias: cmdAlias, macro: cmdMacro,
+  'atime-watch': cmdAtimeWatch, 'trap-fingerprint-check': cmdTrapFingerprintCheck,
+  'events-decrypt': cmdEventsDecrypt, 'geoip-load': cmdGeoipLoad, 'geoip-clear': cmdGeoipClear,
+  '__complete': cmdCompleteHidden,
 };
 // Unified dispatch: built-ins (92) -> extras -> enabled plugin commands ->
 // aliases (with depth-10/cycle guard) -> macros (direct name runs macro).

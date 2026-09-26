@@ -85,6 +85,37 @@ export function driverStatus(plat = detectPlatform()) {
 // ---------- POSIX capture backends (tcpdump / dumpcap) ----------
 export const TCPDUMP_INSTALL_HINT_LINUX = 'install tcpdump: sudo apt install tcpdump (Debian/Ubuntu) / sudo dnf install tcpdump (Fedora) - or wireshark-cli for dumpcap';
 
+// Capability probe for capture tools: lightweight version/status check +
+// output-shape validation. Returns {tool, ok, problem, fix} (never throws).
+// Callers print precise guidance instead of silent garbage.
+export function probeCaptureTool(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const exe = pktmonExe();
+    if (!exe) return { tool: 'pktmon', ok: false, problem: 'PktMon.exe not found', fix: 'needs Windows 10 1809+ / 11 (PktMon.exe inbox)' };
+    try {
+      const r = runPktmon(['status']);
+      if (!r.ok) return { tool: 'pktmon', ok: false, problem: `pktmon status failed (${r.error || r.stderr || 'unknown'})`, fix: 're-open an elevated (Administrator) terminal, then retry' };
+      return { tool: 'pktmon', ok: true, problem: '', fix: '' };
+    } catch (e) {
+      return { tool: 'pktmon', ok: false, problem: String((e && e.message) || e).slice(0, 160), fix: 're-open an elevated terminal' };
+    }
+  }
+  const tool = findPacketExe(plat);
+  if (!tool) {
+    const be = captureBackend(plat);
+    return { tool: plat === 'darwin' ? 'tcpdump' : 'tcpdump/dumpcap', ok: false, problem: 'no capture tool on PATH', fix: be.installHint };
+  }
+  try {
+    const r = spawnSync(tool, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true });
+    const out = String((r && r.stdout) || '') + String((r && r.stderr) || '');
+    if (r && r.error) return { tool, ok: false, problem: `${tool} --version failed (${String(r.error.message || r.error).slice(0, 120)})`, fix: tool === 'tcpdump' ? TCPDUMP_INSTALL_HINT_LINUX : 'install wireshark-cli for dumpcap' };
+    if (!/tcpdump|dumpcap|libpcap/i.test(out)) return { tool, ok: false, problem: `unexpected ${tool} --version output shape`, fix: `run \`${tool} --version\` manually to verify` };
+    return { tool, ok: true, problem: '', fix: '' };
+  } catch (e) {
+    return { tool, ok: false, problem: String((e && e.message) || e).slice(0, 160), fix: TCPDUMP_INSTALL_HINT_LINUX };
+  }
+}
+
 // First capture tool on PATH for POSIX (tcpdump preferred, dumpcap fallback).
 // Windows intentionally returns null here (pktmon path is separate).
 export function findPacketExe(plat = detectPlatform()) {
@@ -96,8 +127,7 @@ export function findPacketExe(plat = detectPlatform()) {
 
 // Backend descriptor for doctor/sysinfo/sniff-check + capture dispatch.
 // Shape: { platform, kind, exe, available, needsRoot, installHint, detail }.
-export function captureBackend(plat = detectPlatform()) {
-  if (plat === 'windows') {
+export function captureBackend(plat = detectPlatform()) {  if (plat === 'windows') {
     const exe = pktmonExe();
     return {
       platform: plat, kind: 'pktmon', exe, available: !!exe, needsRoot: true,
