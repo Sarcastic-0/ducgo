@@ -95,7 +95,7 @@ Running bare `ducgo` (no arguments) prints the banner once and enters a
 persistent `ducgo> ` prompt. It stays open until `exit`, `quit`, or `q`,
 a second `Ctrl+C` within 2 seconds, or EOF (exit code 0). Piped stdin works
 too: lines are executed in order and the shell exits at EOF. Inside the
-shell, `help`/`commands`/`about` print results only (no repeated logo) —
+shell, `help`/`commands`/`about` print results only (no repeated logo) -
 type `banner` anytime to show it again.
 
 ```powershell

@@ -538,7 +538,7 @@ async function requireAuth(dataDir) {
 }
 
 // ---------- shared printers ----------
-// In the interactive REPL the banner already printed once at startup —
+// In the interactive REPL the banner already printed once at startup -
 // help-like output shows results only. Explicit `banner` still prints it.
 function maybeBanner() {
   if (!replActive) ui.printBanner();
