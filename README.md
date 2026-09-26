@@ -94,11 +94,14 @@ Notes:
 - `start` blocks the prompt while the engine runs - that is expected. `Ctrl+C`
   stops the engine and returns to the `ducgo> ` prompt (it does not exit the
   shell). A first `Ctrl+C` at an idle prompt prints `(type exit to quit)`.
-- Unknown commands print an error plus up to 5 suggestions; per-line errors
-  never kill the shell. Tab completion covers all 70 command names; history
-  persists at `<dataDir>\history` (capped at ~500 lines, best-effort).
-- One-shot mode (`ducgo <command> [options]`) is unchanged, and no new
-  user-facing commands were added - the registry stays exactly 70.
+- Unknown commands print an error plus up to 5 suggestions (built-ins +
+  enabled plugins + aliases + macros); per-line errors never kill the shell.
+  Tab completion + `help <name>` cover plugin/alias/macro (origin/expansion
+  shown); history persists at `<dataDir>\history` (capped at ~500 lines,
+  best-effort).
+- One-shot mode (`ducgo <command> [options]`) is unchanged. The registry
+  stays exactly 70 built-ins; extras (plugin mgmt, completion, alias, macro,
+  plugin commands) are never counted - see the `commands` footer line.
 
 ## 70 commands
 
@@ -276,14 +279,77 @@ The screen never reveals that duress mode was triggered.
 - Engine is foreground only (no daemon). `status`/`engine-check` inspect ports;
   stop with `Ctrl+C`.
 
+## Plugins (commands only)
+
+Plugin dir is `<dataDir>\plugins`. A plugin = one `.js` file exporting
+`{ name, version?, commands: [{ name, desc, usage?, run(ctx) }] }` where
+`ctx = { ui, args, config, store, callBuiltIn(name,args), dataDir }`.
+
+Limits: plugins may ONLY add commands. They may NOT hook the trap engine
+or auth. Collisions with built-ins are skipped with a warning. Broken
+plugins warn and are skipped - the tool continues.
+
+Trust warning: `plugin-add <file>` copies the file, prints SHA-256,
+DISABLED by default + warning. Only enable plugins you trust - they run
+as your user with your privileges. Management (`plugin-add`,
+`plugin-enable`, `plugin-disable`, `plugin-list`, `plugin-show`,
+`plugin-remove`) requires the normal PIN; the duress PIN never reveals
+the plugin list (all-clear + silent log, behaves as if no plugins exist).
+Plugin commands also require the normal PIN to run (duress-safe).
+
+Example (`examples/hello-plugin.js`, commands `hello`, `threat-tip`):
+
+```powershell
+"alpha-9912" | node src/cli.js plugin-add examples/hello-plugin.js
+"alpha-9912" | node src/cli.js plugin-list
+"alpha-9912" | node src/cli.js plugin-enable hello-plugin
+"alpha-9912" | node src/cli.js hello
+"alpha-9912" | node src/cli.js threat-tip
+```
+
+## Completion
+
+```powershell
+node src/cli.js completion powershell   # print PowerShell script + manual instructions
+node src/cli.js completion bash         # print bash script + manual instructions
+node src/cli.js completion --install    # install to PowerShell $PROFILE / ~/.bashrc (idempotent marked block)
+node src/cli.js completion --uninstall  # remove the marked block
+```
+
+Hidden `__complete <prefix...>` (never counted/listed) feeds the scripts
+with built-in (70) + enabled-plugin + alias + macro names.
+
+## Aliases + Macros (never counted)
+
+Stored in `config.json`. Management requires the normal PIN like other
+config commands (duress sees nothing extra).
+
+```powershell
+"alpha-9912" | node src/cli.js alias set ll "events --json"
+node src/cli.js ll
+"alpha-9912" | node src/cli.js alias list
+"alpha-9912" | node src/cli.js macro set daily "version; banner"
+"alpha-9912" | node src/cli.js macro run daily
+"alpha-9912" | node src/cli.js macro list
+```
+
+Aliases have a recursion guard (depth 10, cycle -> clean error).
+Macros are `;`-separated: stop-on-first-error in one-shot mode, per-line
+(continue) in REPL.
+
+The 70 contract: `commands --count` stays exactly 70. Extras
+(plugin commands, aliases, macros, plus 9 extra built-ins) appear only in
+the footer line (`+ N plugin command(s), ...`) and are never counted.
+
 ## Project layout
 
 ```text
 package.json        ESM ("type": "module"), bin { ducgo: ./src/cli.js }, no deps
-src/cli.js          hand-rolled args, hidden PIN prompt, all 70 commands
+src/cli.js          hand-rolled args, hidden PIN prompt, 70 built-ins + extras (plugins/completion/alias/macro, never counted)
 src/ui.js           banner/box/table/severity/ok/err/info/dim/event-format/progress (NO_COLOR aware)
 src/auth.js         PBKDF2 PIN + duress store (dataDir-injected, testable)
 src/traps.js        honey TCP / honey HTTP / canary watch / decoy deploy (stdlib only)
-src/store.js        data dir: config.json + events.jsonl (+disabled/banners/notes)
-test/selftest.js    auth + traps (ephemeral) + canary + count==70 + ui + per-command --help smoke
+src/store.js        data dir: config.json (now +plugins/aliases/macros) + events.jsonl (+disabled/banners/notes)
+examples/hello-plugin.js   example plugin (commands hello, threat-tip) used by tests
+test/selftest.js    auth + traps (ephemeral) + canary + count==70 + ui + per-command --help smoke + plugins/completion/alias/macro
 ```

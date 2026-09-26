@@ -36,6 +36,9 @@ export function loadConfig(dataDir) {
     banners: {},
     httpTitle: 'Admin Login',
     notes: {},
+    plugins: {},
+    aliases: {},
+    macros: {},
   };
   try {
     const j = JSON.parse(fs.readFileSync(configPath(dataDir), 'utf8'));
@@ -58,6 +61,35 @@ export function loadConfig(dataDir) {
       if (j.notes && typeof j.notes === 'object' && !Array.isArray(j.notes)) {
         for (const [k, v] of Object.entries(j.notes)) {
           if (Array.isArray(v)) cfg.notes[String(k)] = v.filter((n) => n && typeof n === 'object').slice(0, 200);
+        }
+      }
+      if (j.plugins && typeof j.plugins === 'object' && !Array.isArray(j.plugins)) {
+        for (const [k, v] of Object.entries(j.plugins)) {
+          if (v && typeof v === 'object' && !Array.isArray(v)) {
+            const e = {
+              enabled: !!v.enabled,
+              file: String(v.file || k + '.js').slice(0, 200),
+              sha256: typeof v.sha256 === 'string' ? v.sha256.slice(0, 128) : '',
+              name: typeof v.name === 'string' ? v.name.slice(0, 120) : String(k).slice(0, 120),
+              version: typeof v.version === 'string' ? v.version.slice(0, 40) : '',
+              commands: Array.isArray(v.commands) ? v.commands.map(String).slice(0, 20) : [],
+            };
+            cfg.plugins[String(k).slice(0, 120)] = e;
+          }
+        }
+      }
+      if (j.aliases && typeof j.aliases === 'object' && !Array.isArray(j.aliases)) {
+        for (const [k, v] of Object.entries(j.aliases)) {
+          if (typeof v === 'string' && String(k).length > 0 && String(k).length <= 80) {
+            cfg.aliases[String(k)] = String(v).slice(0, 2000);
+          }
+        }
+      }
+      if (j.macros && typeof j.macros === 'object' && !Array.isArray(j.macros)) {
+        for (const [k, v] of Object.entries(j.macros)) {
+          if (typeof v === 'string' && String(k).length > 0 && String(k).length <= 80) {
+            cfg.macros[String(k)] = String(v).slice(0, 4000);
+          }
         }
       }
       // Preserve unknown future keys? No - strict schema keeps file clean.

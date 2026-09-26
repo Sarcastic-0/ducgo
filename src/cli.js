@@ -6,8 +6,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as net from 'node:net';
+import * as crypto from 'node:crypto';
 import * as readline from 'node:readline';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isSetup, setupPins, verifyPin, loadAuth, changeAccessPin, changeDuressPin } from './auth.js';
 import {
   getDataDir,
@@ -130,8 +131,162 @@ export const COMMANDS = [
 export const COMMAND_NAMES = COMMANDS.map((c) => c.name);
 export const COMMAND_COUNT = COMMANDS.length;
 
+// ---------- extras (NEVER counted in the 70 contract) ----------
+// Built-in extras: plugin management (6) + completion + alias + macro = 9,
+// plus hidden __complete. None of these live in COMMANDS, so
+// `commands --count` stays exactly 70. They are listed only in the footer
+// line (`+ N plugin command(s), ...`) and via __complete/REPL completer.
+// Plugins may ONLY add commands - they may NOT hook the trap engine or auth.
+export const EXTRA_BUILTINS = [
+  { name: 'plugin-add', group: 'extra', desc: 'Copy a plugin file into the store (disabled by default)', usage: 'ducgo plugin-add <file>' },
+  { name: 'plugin-enable', group: 'extra', desc: 'Enable a plugin (needs PIN)', usage: 'ducgo plugin-enable <id>' },
+  { name: 'plugin-disable', group: 'extra', desc: 'Disable a plugin (needs PIN)', usage: 'ducgo plugin-disable <id>' },
+  { name: 'plugin-list', group: 'extra', desc: 'List plugins (needs PIN)', usage: 'ducgo plugin-list' },
+  { name: 'plugin-show', group: 'extra', desc: 'Show one plugin (needs PIN)', usage: 'ducgo plugin-show <id>' },
+  { name: 'plugin-remove', group: 'extra', desc: 'Remove a plugin (needs PIN)', usage: 'ducgo plugin-remove <id>' },
+  { name: 'completion', group: 'extra', desc: 'Print/install shell completion', usage: 'ducgo completion powershell|bash [--install] [--uninstall]' },
+  { name: 'alias', group: 'extra', desc: 'Manage command aliases (needs PIN)', usage: 'ducgo alias set|get|list|remove ...' },
+  { name: 'macro', group: 'extra', desc: 'Manage command macros (needs PIN)', usage: 'ducgo macro set|list|run|remove ...' },
+];
+export const EXTRA_BUILTIN_NAMES = EXTRA_BUILTINS.map((c) => c.name);
+export const HIDDEN_COMMANDS = ['__complete'];
+
 function findCmd(name) {
   return COMMANDS.find((c) => c.name === name) || null;
+}
+function findExtraBuiltin(name) {
+  return EXTRA_BUILTINS.find((c) => c.name === name) || null;
+}
+
+// ---------- plugin store helpers (stdlib only) ----------
+function getPluginDir(dataDir) {
+  return path.join(dataDir, 'plugins');
+}
+function ensurePluginDir(dataDir) {
+  fs.mkdirSync(getPluginDir(dataDir), { recursive: true });
+  return getPluginDir(dataDir);
+}
+function sha256File(filePath) {
+  const h = crypto.createHash('sha256');
+  h.update(fs.readFileSync(filePath));
+  return h.digest('hex');
+}
+function isValidExtraName(n) {
+  return typeof n === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(n) && n.length <= 80;
+}
+// Resolve a plugin id (config key, exported name, file basename, or filename).
+function resolvePluginId(cfg, id) {
+  const s = String(id || '');
+  if (cfg.plugins[s]) return s;
+  for (const [k, v] of Object.entries(cfg.plugins)) {
+    if (v && (v.name === s || v.file === s || v.file === s + '.js')) return k;
+    if (k.toLowerCase() === s.toLowerCase()) return k;
+  }
+  const base = path.basename(s, '.js');
+  if (cfg.plugins[base]) return base;
+  return null;
+}
+// Validate a loaded plugin module shape. Returns { ok, name, version, commands, error }.
+function validatePluginShape(exp) {
+  if (!exp || typeof exp !== 'object') return { ok: false, error: 'plugin must export an object { name, commands }' };
+  if (typeof exp.name !== 'string' || !exp.name.trim()) return { ok: false, error: 'plugin.name must be a non-empty string' };
+  if (exp.version !== undefined && typeof exp.version !== 'string') return { ok: false, error: 'plugin.version must be a string' };
+  if (!Array.isArray(exp.commands)) return { ok: false, error: 'plugin.commands must be an array' };
+  for (const c of exp.commands) {
+    if (!c || typeof c !== 'object') return { ok: false, error: 'each plugin command must be an object { name, desc, run }' };
+    if (!isValidExtraName(c.name)) return { ok: false, error: `invalid plugin command name: ${String(c.name)}` };
+    if (typeof c.desc !== 'string' || !c.desc.trim()) return { ok: false, error: `plugin command "${c.name}" needs a non-empty desc` };
+    if (c.usage !== undefined && typeof c.usage !== 'string') return { ok: false, error: `plugin command "${c.name}" usage must be a string` };
+    if (typeof c.run !== 'function') return { ok: false, error: `plugin command "${c.name}" run(ctx) must be a function` };
+  }
+  return { ok: true, name: exp.name.trim(), version: typeof exp.version === 'string' ? exp.version : '', commands: exp.commands };
+}
+// Load plugins from <dataDir>/plugins. Isolates failures: broken files warn and are skipped.
+// Returns { plugins: [{ id, file, sha256, enabled, name, version, commands, broken, warning }], cmdMap: Map(cmdName -> { pluginId, def }) }.
+// Only ENABLED plugins contribute to cmdMap. Collisions with built-ins/extras or
+// earlier plugin commands are skipped with a warning.
+export async function loadPlugins(dataDir) {
+  const cfg = loadConfig(dataDir);
+  const dir = getPluginDir(dataDir);
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.js')); } catch { files = []; }
+  const plugins = [];
+  const cmdMap = new Map();
+  const taken = new Set([...COMMAND_NAMES, ...EXTRA_BUILTIN_NAMES, ...HIDDEN_COMMANDS]);
+  for (const f of files) {
+    const fp = path.join(dir, f);
+    const id = path.basename(f, '.js');
+    let liveSha = '';
+    try { liveSha = sha256File(fp); } catch { liveSha = ''; }
+    const stored = cfg.plugins[id] || cfg.plugins[f] || null;
+    const enabled = stored ? !!stored.enabled : false;
+    const storedSha = stored ? (stored.sha256 || '') : '';
+    let exp = null;
+    try {
+      let mtime = 0;
+      try { mtime = fs.statSync(fp).mtimeMs; } catch { mtime = 0; }
+      const url = pathToFileURL(fp).href + `?t=${Math.floor(mtime)}`;
+      const mod = await import(url);
+      exp = mod && mod.default !== undefined ? mod.default : mod;
+    } catch (e) {
+      const msg = `Plugin "${f}" failed to load (${String((e && e.message) || e).slice(0, 160)}) - skipped.`;
+      ui.warn(msg);
+      plugins.push({ id, file: f, sha256: liveSha || storedSha, enabled, name: (stored && stored.name) || id, version: (stored && stored.version) || '', commands: [], broken: true, warning: msg });
+      continue;
+    }
+    const v = validatePluginShape(exp);
+    if (!v.ok) {
+      const msg = `Plugin "${f}" invalid (${v.error}) - skipped.`;
+      ui.warn(msg);
+      plugins.push({ id, file: f, sha256: liveSha || storedSha, enabled, name: (stored && stored.name) || id, version: (stored && stored.version) || '', commands: [], broken: true, warning: msg });
+      continue;
+    }
+    const cmds = [];
+    for (const c of v.commands) {
+      if (taken.has(c.name)) {
+        ui.warn(`Plugin "${f}" command "${c.name}" collides with a built-in - skipped.`);
+        continue;
+      }
+      if (cmdMap.has(c.name)) {
+        ui.warn(`Plugin "${f}" command "${c.name}" collides with another plugin - skipped.`);
+        continue;
+      }
+      taken.add(c.name);
+      cmds.push({ name: c.name, desc: c.desc, usage: typeof c.usage === 'string' && c.usage ? c.usage : `ducgo ${c.name}`, run: c.run, group: 'plugin-cmd' });
+      if (enabled) cmdMap.set(c.name, { pluginId: id, pluginName: v.name, def: c });
+    }
+    plugins.push({ id, file: f, sha256: liveSha || storedSha, enabled, name: v.name, version: v.version, commands: cmds.map((c) => c.name), broken: false, warning: '' });
+  }
+  // Config entries whose file is missing (removed by hand): report as missing, keep entry until plugin-remove.
+  for (const [k, v] of Object.entries(cfg.plugins)) {
+    if (!files.includes(v.file) && !files.includes(k + '.js') && !files.includes(k)) {
+      plugins.push({ id: k, file: v.file || (k + '.js'), sha256: v.sha256 || '', enabled: !!v.enabled, name: v.name || k, version: v.version || '', commands: [], broken: true, warning: 'file missing' });
+    }
+  }
+  return { plugins, cmdMap };
+}
+// Sync names-only view for REPL completer/suggestions (no import, no warnings).
+function listPluginCommandNamesSync(dataDir) {
+  try {
+    const cfg = loadConfig(dataDir);
+    const out = [];
+    for (const [, v] of Object.entries(cfg.plugins)) {
+      if (!v || !v.enabled) continue;
+      if (Array.isArray(v.commands)) for (const n of v.commands) if (typeof n === 'string' && n) out.push(n);
+    }
+    return [...new Set(out)];
+  } catch { return []; }
+}
+function allCompletionNamesSync(dataDir) {
+  try {
+    const cfg = loadConfig(dataDir);
+    const pluginNames = listPluginCommandNamesSync(dataDir);
+    const aliasNames = cfg.aliases ? Object.keys(cfg.aliases) : [];
+    const macroNames = cfg.macros ? Object.keys(cfg.macros) : [];
+    return [...COMMAND_NAMES, ...EXTRA_BUILTIN_NAMES, ...pluginNames, ...aliasNames, ...macroNames];
+  } catch {
+    return [...COMMAND_NAMES, ...EXTRA_BUILTIN_NAMES];
+  }
 }
 
 // ---------- arg helpers (hand-rolled, no deps) ----------
@@ -368,6 +523,29 @@ function printGroupedCommands() {
   }
   console.log(ui.dim(`Total: ${COMMANDS.length} commands. Try "ducgo help <command>".`));
 }
+async function printExtrasFooter() {
+  try {
+    const dataDir = getDataDir();
+    const cfg = loadConfig(dataDir);
+    const aliasNames = cfg.aliases ? Object.keys(cfg.aliases) : [];
+    const macroNames = cfg.macros ? Object.keys(cfg.macros) : [];
+    let pluginCmdCount = 0;
+    try {
+      const loaded = await loadPlugins(dataDir);
+      pluginCmdCount = loaded.cmdMap.size;
+    } catch {
+      // footer is best-effort; fall back to stored counts
+      for (const [, v] of Object.entries(cfg.plugins || {})) {
+        if (v && v.enabled && Array.isArray(v.commands)) pluginCmdCount += v.commands.length;
+      }
+    }
+    const extraBuiltinCount = EXTRA_BUILTIN_NAMES.length;
+    console.log(ui.dim(`+ ${pluginCmdCount} plugin command(s), ${aliasNames.length} alias(es), ${macroNames.length} macro(s), ${extraBuiltinCount} extra command(s) (extras never counted in the 70)`));
+    if (pluginCmdCount > 0 || aliasNames.length > 0 || macroNames.length > 0) {
+      ui.dim('Extras: plugin commands run with group plugin-cmd; aliases/macros expand locally. Try "ducgo help <name>".');
+    }
+  } catch { /* footer is best-effort */ }
+}
 function printHelp() {
   ui.printBanner();
   console.log('');
@@ -392,11 +570,65 @@ function printHelp() {
 }
 function cmdUsage(name) {
   const c = findCmd(name);
-  if (!c) { console.error(`Unknown command: ${name}`); process.exit(1); }
-  ui.printBanner();
-  console.log('');
-  console.log(ui.bold(`ducgo ${c.name}`) + ` - ${c.desc}`);
-  console.log(`Usage: ${c.usage}`);
+  if (c) {
+    ui.printBanner();
+    console.log('');
+    console.log(ui.bold(`ducgo ${c.name}`) + ` - ${c.desc}`);
+    console.log(`Usage: ${c.usage}`);
+    return;
+  }
+  const ex = findExtraBuiltin(name);
+  if (ex) {
+    ui.printBanner();
+    console.log('');
+    console.log(ui.bold(`ducgo ${ex.name}`) + ` - ${ex.desc} [extra, never counted in the 70]`);
+    console.log(`Usage: ${ex.usage}`);
+    return;
+  }
+  // Plugin / alias / macro help is async (needs store + plugin load).
+  return cmdUsageExtra(name);
+}
+async function cmdUsageExtra(name) {
+  const dataDir = getDataDir();
+  const cfg = loadConfig(dataDir);
+  if (cfg.aliases && cfg.aliases[name] !== undefined) {
+    ui.printBanner();
+    console.log('');
+    console.log(ui.bold(`ducgo ${name}`) + ' - alias [extra, never counted]');
+    console.log(`Expands to: ${cfg.aliases[name]}`);
+    console.log(`Usage: ducgo ${cfg.aliases[name]}`);
+    return;
+  }
+  if (cfg.macros && cfg.macros[name] !== undefined) {
+    ui.printBanner();
+    console.log('');
+    console.log(ui.bold(`ducgo ${name}`) + ' - macro [extra, never counted]');
+    console.log(`Runs (; -separated): ${cfg.macros[name]}`);
+    console.log(`Usage: ducgo macro run ${name}`);
+    return;
+  }
+  try {
+    const loaded = await loadPlugins(dataDir);
+    if (loaded.cmdMap.has(name)) {
+      const entry = loaded.cmdMap.get(name);
+      ui.printBanner();
+      console.log('');
+      console.log(ui.bold(`ducgo ${name}`) + ` - ${entry.def.desc} [plugin: ${entry.pluginName}, group plugin-cmd]`);
+      console.log(`Usage: ${entry.def.usage || `ducgo ${name}`}`);
+      return;
+    }
+    for (const p of loaded.plugins) {
+      if (p.name === name || p.id === name) {
+        ui.printBanner();
+        console.log('');
+        console.log(ui.bold(`plugin ${p.name}`) + ` - v${p.version || '0'} [${p.enabled ? 'enabled' : 'disabled'}]`);
+        console.log(`Commands: ${p.commands.join(', ') || '(none)'}`);
+        return;
+      }
+    }
+  } catch { /* ignore, fall through to unknown */ }
+  console.error(`Unknown command: ${name}`);
+  process.exit(1);
 }
 function groupByIp(events) {
   const groups = new Map();
@@ -1185,7 +1417,7 @@ async function cmdConfigReset(rest) {
   if (wantsHelp(rest)) return cmdUsage('config-reset');
   const dataDir = getDataDir();
   await requireAuth(dataDir);
-  saveConfig(dataDir, { ports: [...DEFAULT_PORTS], httpPort: DEFAULT_HTTP_PORT, watchDirs: [], disabled: [], banners: {}, httpTitle: 'Admin Login', notes: {} });
+  saveConfig(dataDir, { ports: [...DEFAULT_PORTS], httpPort: DEFAULT_HTTP_PORT, watchDirs: [], disabled: [], banners: {}, httpTitle: 'Admin Login', notes: {}, plugins: {}, aliases: {}, macros: {} });
   ui.ok('Config reset to defaults.');
 }
 async function cmdDataDir(rest) {
@@ -1227,8 +1459,446 @@ async function cmdConfigImport(rest) {
   if (Array.isArray(j.disabled)) next.disabled = [...new Set(j.disabled.map(String))];
   if (j.banners && typeof j.banners === 'object') next.banners = j.banners;
   if (typeof j.httpTitle === 'string' && j.httpTitle.length <= 120) next.httpTitle = j.httpTitle;
+  if (j.plugins && typeof j.plugins === 'object' && !Array.isArray(j.plugins)) next.plugins = j.plugins;
+  if (j.aliases && typeof j.aliases === 'object' && !Array.isArray(j.aliases)) next.aliases = j.aliases;
+  if (j.macros && typeof j.macros === 'object' && !Array.isArray(j.macros)) next.macros = j.macros;
   saveConfig(dataDir, next);
   ui.ok(`Config imported from ${path.resolve(file)}`);
+}
+
+// ================= PLUGINS (commands only; NO trap-engine or auth hooks) =================
+// Limits (documented): plugins may ONLY export commands [{ name, desc, usage?, run(ctx) }]
+// with ctx = { ui, args, config, store, callBuiltIn(name,args), dataDir }.
+// They cannot hook the trap engine, cannot touch auth, and run only when
+// explicitly invoked (or via callBuiltIn). Collisions with built-ins are
+// skipped with a warning. Broken plugins warn and are skipped. Trust model:
+// plugin-add copies the file, prints SHA-256, DISABLED by default + warning.
+// Only enable plugins you trust - they run as your user with your privileges.
+async function cmdPluginAdd(rest) {
+  if (wantsHelp(rest)) return cmdUsage('plugin-add');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const file = firstPositional(rest);
+  if (!file) fail('Usage: ducgo plugin-add <file>');
+  const src = path.resolve(file);
+  let stat = null;
+  try { stat = fs.statSync(src); } catch { fail(`Cannot read: ${file}`); }
+  if (!stat.isFile()) fail(`Not a file: ${file}`);
+  if (!src.endsWith('.js')) fail('Plugin must be a single .js file.');
+  let sha = '';
+  try { sha = sha256File(src); } catch (e) { fail(`Cannot hash: ${String((e && e.message) || e)}`); }
+  ensurePluginDir(dataDir);
+  const base = path.basename(src);
+  const dest = path.join(getPluginDir(dataDir), base);
+  try { fs.copyFileSync(src, dest); } catch (e) { fail(`Copy failed: ${String((e && e.message) || e)}`); }
+  const id = path.basename(base, '.js');
+  const cfg = loadConfig(dataDir);
+  if (!cfg.plugins) cfg.plugins = {};
+  // Try to read metadata now (best-effort) for list/show even while disabled.
+  let pname = id; let pver = ''; let pcmds = [];
+  try {
+    const url = pathToFileURL(dest).href + `?t=${Date.now()}`;
+    const mod = await import(url);
+    const exp = mod && mod.default !== undefined ? mod.default : mod;
+    const v = validatePluginShape(exp);
+    if (v.ok) { pname = v.name; pver = v.version; pcmds = v.commands.map((c) => c.name); }
+    else ui.warn(`Plugin added but invalid (${v.error}) - fix or remove it.`);
+  } catch (e) {
+    ui.warn(`Plugin added but failed to load (${String((e && e.message) || e).slice(0, 160)}) - fix or remove it.`);
+  }
+  cfg.plugins[id] = { enabled: false, file: base, sha256: sha, name: pname, version: pver, commands: pcmds };
+  saveConfig(dataDir, cfg);
+  console.log(`SHA-256: ${sha}`);
+  ui.warn(`Plugin "${base}" added DISABLED by default. Only enable plugins you trust - they run as your user. It CANNOT hook the trap engine or auth; it can only add commands.`);
+  ui.info(`Run "ducgo plugin-enable ${id}" to enable, "ducgo plugin-list" to review.`);
+}
+async function cmdPluginEnable(rest) {
+  if (wantsHelp(rest)) return cmdUsage('plugin-enable');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const id = firstPositional(rest);
+  if (!id) fail('Usage: ducgo plugin-enable <id>');
+  const cfg = loadConfig(dataDir);
+  const key = resolvePluginId(cfg, id);
+  if (!key) fail(`No such plugin: ${id}`);
+  cfg.plugins[key].enabled = true;
+  // Refresh stored metadata on enable (best-effort).
+  try {
+    const fp = path.join(getPluginDir(dataDir), cfg.plugins[key].file);
+    const url = pathToFileURL(fp).href + `?t=${Date.now()}`;
+    const mod = await import(url);
+    const exp = mod && mod.default !== undefined ? mod.default : mod;
+    const v = validatePluginShape(exp);
+    if (v.ok) { cfg.plugins[key].name = v.name; cfg.plugins[key].version = v.version; cfg.plugins[key].commands = v.commands.map((c) => c.name); try { cfg.plugins[key].sha256 = sha256File(fp); } catch { /* keep */ } }
+  } catch { /* keep stored metadata */ }
+  saveConfig(dataDir, cfg);
+  ui.ok(`Plugin enabled: ${key}`);
+}
+async function cmdPluginDisable(rest) {
+  if (wantsHelp(rest)) return cmdUsage('plugin-disable');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const id = firstPositional(rest);
+  if (!id) fail('Usage: ducgo plugin-disable <id>');
+  const cfg = loadConfig(dataDir);
+  const key = resolvePluginId(cfg, id);
+  if (!key) fail(`No such plugin: ${id}`);
+  cfg.plugins[key].enabled = false;
+  saveConfig(dataDir, cfg);
+  ui.ok(`Plugin disabled: ${key}`);
+}
+async function cmdPluginList(rest) {
+  if (wantsHelp(rest)) return cmdUsage('plugin-list');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const loaded = await loadPlugins(dataDir);
+  if (loaded.plugins.length === 0) { ui.dim('No plugins. Use "ducgo plugin-add <file>".'); return; }
+  const rows = loaded.plugins.map((p) => [p.name, p.version || '-', p.enabled ? 'enabled' : 'disabled', (p.commands.join(', ') || '(none)'), String(p.sha256 || '').slice(0, 16)]);
+  console.log(ui.table(['NAME', 'VERSION', 'STATE', 'COMMANDS', 'SHA'], rows));
+  ui.dim('Plugins can only add commands - they cannot hook the trap engine or auth.');
+}
+async function cmdPluginShow(rest) {
+  if (wantsHelp(rest)) return cmdUsage('plugin-show');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const id = firstPositional(rest);
+  if (!id) fail('Usage: ducgo plugin-show <id>');
+  const loaded = await loadPlugins(dataDir);
+  const p = loaded.plugins.find((x) => x.id === id || x.name === id || x.file === id);
+  if (!p) fail(`No such plugin: ${id}`);
+  console.log(ui.box(`plugin ${p.name}`, [`id: ${p.id}`, `file: ${p.file}`, `version: ${p.version || '-'}`, `enabled: ${p.enabled ? 'yes' : 'no'}`, `commands: ${p.commands.join(', ') || '(none)'}`, `sha256: ${p.sha256 || '-'}`, p.broken ? `broken: ${p.warning}` : 'status: ok']));
+}
+async function cmdPluginRemove(rest) {
+  if (wantsHelp(rest)) return cmdUsage('plugin-remove');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const id = firstPositional(rest);
+  if (!id) fail('Usage: ducgo plugin-remove <id>');
+  const cfg = loadConfig(dataDir);
+  const key = resolvePluginId(cfg, id);
+  if (!key) fail(`No such plugin: ${id}`);
+  const entry = cfg.plugins[key];
+  try { fs.unlinkSync(path.join(getPluginDir(dataDir), entry.file)); } catch { /* missing -> still drop config */ }
+  try { fs.unlinkSync(path.join(getPluginDir(dataDir), key + '.js')); } catch { /* ignore */ }
+  delete cfg.plugins[key];
+  saveConfig(dataDir, cfg);
+  ui.ok(`Plugin removed: ${key}`);
+}
+// Run an enabled plugin command. Plugin commands require normal PIN (duress
+// behaves as if no plugins exist: all-clear + silent log, command unavailable).
+async function runPluginCommand(cmdName, args) {
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const loaded = await loadPlugins(dataDir);
+  const entry = loaded.cmdMap.get(cmdName);
+  if (!entry) fail(`Unknown command: ${cmdName}`);
+  const cfg = loadConfig(dataDir);
+  const ctx = {
+    ui,
+    args: [...args],
+    config: cfg,
+    store: { loadConfig, saveConfig, readEvents, appendEvent, getDataDir },
+    dataDir,
+    callBuiltIn: async (bname, bargs) => {
+      const bfn = HANDLERS[bname] || EXTRA_HANDLERS[bname];
+      if (!bfn) throw new Error(`Unknown built-in: ${bname}`);
+      await bfn([...(bargs || [])]);
+    },
+  };
+  try {
+    await entry.def.run(ctx);
+  } catch (e) {
+    fail(`Plugin command "${cmdName}" failed: ${String((e && e.message) || e).slice(0, 300)}`);
+  }
+}
+
+// ================= COMPLETION =================
+function powershellCompletionScript() {
+  return [
+    '# >>> ducgo completion >>>',
+    '# ducgo PowerShell completion (generated by `ducgo completion powershell`).',
+    '# Dynamic: queries `ducgo __complete` for built-ins + enabled plugins + aliases + macros.',
+    'Register-ArgumentCompleter -Native -CommandName ducgo -ScriptBlock {',
+    '  param($wordToComplete, $commandAst, $cursorPosition)',
+    '  try {',
+    '    $tokens = @()',
+    '    try { $tokens = $commandAst.ToString() -split "\\s+" } catch { $tokens = @() }',
+    '    $prefix = $wordToComplete',
+    '    $out = & ducgo __complete -- "$prefix" 2>$null',
+    '    if (-not $out) { return }',
+    '    $out -split "\\r?\\n" | Where-Object { $_ -ne "" } | ForEach-Object {',
+    '      [System.Management.Automation.CompletionResult]::new($_, $_, "ParameterValue", $_)',
+    '    }',
+    '  } catch { }',
+    '}',
+    '# <<< ducgo completion <<<',
+  ].join('\n');
+}
+function bashCompletionScript() {
+  return [
+    '# >>> ducgo completion >>>',
+    '# ducgo bash completion (generated by `ducgo completion bash`).',
+    '# Dynamic: queries `ducgo __complete` for built-ins + enabled plugins + aliases + macros.',
+    '_ducgo_completions() {',
+    '  local cur="${COMP_WORDS[COMP_CWORD]}"',
+    '  local comps=""',
+    '  if command -v ducgo >/dev/null 2>&1; then',
+    '    comps=$(ducgo __complete -- "$cur" 2>/dev/null)',
+    '  fi',
+    '  COMPREPLY=( $(compgen -W "$comps" -- "$cur") )',
+    '}',
+    'complete -F _ducgo_completions ducgo',
+    '# <<< ducgo completion <<<',
+  ].join('\n');
+}
+function completionBlock(shell) {
+  return shell === 'powershell' ? powershellCompletionScript() : bashCompletionScript();
+}
+async function getPowerShellProfileAsync() {
+  try {
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync('powershell', ['-NoProfile', '-Command', 'echo $PROFILE'], { encoding: 'utf8', timeout: 8000 });
+    const p = String((r && r.stdout) || '').trim();
+    if (p) return p;
+  } catch { /* ignore */ }
+  const docs = path.join(os.homedir(), 'Documents');
+  return path.join(docs, 'WindowsPowerShell', 'Microsoft.PowerShell_profile.ps1');
+}
+function getBashRcPath() {
+  return path.join(os.homedir(), '.bashrc');
+}
+function upsertBlock(file, block) {
+  ensureDataDir(path.dirname(file));
+  let cur = '';
+  try { cur = fs.readFileSync(file, 'utf8'); } catch { cur = ''; }
+  if (cur.includes('# >>> ducgo completion >>>') && cur.includes('# <<< ducgo completion <<<')) return 'exists';
+  const sep = cur.endsWith('\n') || cur === '' ? '' : '\n';
+  fs.writeFileSync(file, cur + sep + block + '\n', 'utf8');
+  return 'added';
+}
+function removeBlock(file) {
+  let cur = null;
+  try { cur = fs.readFileSync(file, 'utf8'); } catch { return 'missing'; }
+  const start = cur.indexOf('# >>> ducgo completion >>>');
+  const end = cur.indexOf('# <<< ducgo completion <<<');
+  if (start === -1 || end === -1) return 'absent';
+  const after = end + '# <<< ducgo completion <<<'.length;
+  const next = cur.slice(0, start) + cur.slice(after);
+  fs.writeFileSync(file, next.replace(/\n{3,}/g, '\n\n'), 'utf8');
+  return 'removed';
+}
+function printManualCompletionInstructions() {
+  console.log(ui.bold('Manual install:'));
+  console.log('  PowerShell: run `ducgo completion powershell` and append the block to your $PROFILE (run `echo $PROFILE` to find it), then restart the shell.');
+  console.log('  Bash: run `ducgo completion bash` and append the block to ~/.bashrc, then run `source ~/.bashrc`.');
+  console.log(ui.dim('The block is idempotent (marked >>> ducgo completion >>>). __complete stays hidden and is never counted.'));
+}
+async function cmdCompletion(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo completion powershell|bash [--install] [--uninstall]'); printManualCompletionInstructions(); return; }
+  const doInstall = hasFlag(rest, ['--install']);
+  const doUninstall = hasFlag(rest, ['--uninstall']);
+  const shellPos = positionals(rest).filter((a) => a !== '--' && !a.startsWith('-'))[0] || null;
+  if (doInstall && doUninstall) fail('Use either --install or --uninstall, not both.');
+  if (doUninstall) {
+    const targets = [];
+    if (!shellPos || shellPos === 'powershell') targets.push(await getPowerShellProfileAsync());
+    if (!shellPos || shellPos === 'bash') targets.push(getBashRcPath());
+    for (const t of targets) {
+      const r = removeBlock(t);
+      ui.info(`${t}: ${r}`);
+    }
+    ui.ok('Completion uninstalled (marked block removed where present).');
+    return;
+  }
+  if (doInstall) {
+    const targets = [];
+    if (!shellPos || shellPos === 'powershell') targets.push({ shell: 'powershell', file: await getPowerShellProfileAsync() });
+    if (!shellPos || shellPos === 'bash') targets.push({ shell: 'bash', file: getBashRcPath() });
+    // On Windows default to PowerShell only when no shell given? Install both when explicit, else platform default + always show manual.
+    let list = targets;
+    if (!shellPos) {
+      list = process.platform === 'win32'
+        ? [{ shell: 'powershell', file: await getPowerShellProfileAsync() }]
+        : [{ shell: 'bash', file: getBashRcPath() }];
+    }
+    for (const t of list) {
+      const r = upsertBlock(t.file, completionBlock(t.shell));
+      ui.ok(`${t.shell} completion ${r} in ${t.file}`);
+    }
+    printManualCompletionInstructions();
+    return;
+  }
+  if (shellPos === 'powershell') { console.log(powershellCompletionScript()); printManualCompletionInstructions(); return; }
+  if (shellPos === 'bash') { console.log(bashCompletionScript()); printManualCompletionInstructions(); return; }
+  console.log('Usage: ducgo completion powershell|bash [--install] [--uninstall]');
+  printManualCompletionInstructions();
+}
+// Hidden: `__complete <prefix...>` - never counted/listed. Prints matches one per line.
+async function cmdCompleteHidden(rest) {
+  if (wantsHelp(rest)) { console.log('Usage: ducgo __complete [--] [prefix...]'); return; }
+  const pos = positionals(rest).filter((a) => a !== '--');
+  const prefix = pos.length > 0 ? pos[pos.length - 1] : '';
+  const all = allCompletionNamesSync(getDataDir());
+  const matches = all.filter((n) => n.startsWith(prefix));
+  for (const m of matches.sort()) console.log(m);
+}
+
+// ================= ALIASES + MACROS (never counted) =================
+// Aliases: single-command shortcuts. Macros: `;`-separated multi-command runs.
+// Alias/macro MANAGEMENT requires normal PIN like other config commands
+// (duress sees nothing extra: all-clear + silent log). Alias expansion has a
+// recursion guard (depth 10, cycle -> clean error). Macro run is `;`-separated:
+// stop-on-first-error in one-shot mode, per-line (continue) in REPL.
+function aliasTargetBlocked(name) {
+  return COMMAND_NAMES.includes(name) || EXTRA_BUILTIN_NAMES.includes(name) || HIDDEN_COMMANDS.includes(name);
+}
+async function cmdAlias(rest) {
+  if (wantsHelp(rest) || rest.length === 0) { console.log('Usage: ducgo alias set <name> <expansion...> | ducgo alias get <name> | ducgo alias list | ducgo alias remove <name>'); return; }
+  const sub = rest[0];
+  const tail = rest.slice(1);
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const cfg = loadConfig(dataDir);
+  if (!cfg.aliases) cfg.aliases = {};
+  if (sub === 'set') {
+    const aname = tail[0];
+    const expansion = tail.slice(1).join(' ').trim();
+    if (!aname || !expansion) fail('Usage: ducgo alias set <name> <expansion...>');
+    if (!isValidExtraName(aname)) fail(`Invalid alias name: "${aname}" (use letters/numbers/_/-)`);
+    if (aliasTargetBlocked(aname)) fail(`Alias name collides with a built-in: ${aname}`);
+    try {
+      const loaded = await loadPlugins(dataDir);
+      if (loaded.cmdMap.has(aname)) fail(`Alias name collides with a plugin command: ${aname}`);
+    } catch { /* ignore */ }
+    if (cfg.macros && cfg.macros[aname] !== undefined) fail(`Alias name collides with a macro: ${aname}`);
+    cfg.aliases[aname] = expansion.slice(0, 2000);
+    saveConfig(dataDir, cfg);
+    ui.ok(`Alias set: ${aname} -> ${expansion}`);
+    return;
+  }
+  if (sub === 'get') {
+    const aname = firstPositional(tail);
+    if (!aname) fail('Usage: ducgo alias get <name>');
+    if (cfg.aliases[aname] === undefined) fail(`No such alias: ${aname}`);
+    console.log(ui.box(`alias ${aname}`, [cfg.aliases[aname]]));
+    return;
+  }
+  if (sub === 'list') {
+    const keys = Object.keys(cfg.aliases);
+    if (keys.length === 0) { ui.dim('No aliases. Use "ducgo alias set <name> <expansion>".'); return; }
+    console.log(ui.table(['ALIAS', 'EXPANDS TO'], keys.sort().map((k) => [k, cfg.aliases[k]])));
+    return;
+  }
+  if (sub === 'remove') {
+    const aname = firstPositional(tail);
+    if (!aname) fail('Usage: ducgo alias remove <name>');
+    if (cfg.aliases[aname] === undefined) fail(`No such alias: ${aname}`);
+    delete cfg.aliases[aname];
+    saveConfig(dataDir, cfg);
+    ui.ok(`Alias removed: ${aname}`);
+    return;
+  }
+  fail('Usage: ducgo alias set|get|list|remove ...');
+}
+// Iterative alias expansion returning final tokens (handles chains + cycle guard).
+function resolveAliasTokens(name, extraArgs = []) {
+  const cfg = loadConfig(getDataDir());
+  if (!cfg.aliases || cfg.aliases[name] === undefined) return null;
+  const visited = [name];
+  let exp = cfg.aliases[name];
+  for (let depth = 0; depth < 10; depth++) {
+    let toks;
+    try { toks = splitReplLine(exp); } catch (e) { throw new Error(`Alias "${name}" is invalid: ${String((e && e.message) || e)}`); }
+    if (toks.length === 0) throw new Error(`Alias "${name}" is empty.`);
+    const head = toks[0];
+    const tailArgs = toks.slice(1);
+    if (cfg.aliases && cfg.aliases[head] !== undefined) {
+      if (visited.includes(head)) throw new Error(`Alias cycle detected: ${[...visited, head].join(' -> ')}`);
+      visited.push(head);
+      exp = cfg.aliases[head] + (tailArgs.length > 0 || extraArgs.length > 0 ? ' ' + [...tailArgs, ...(depth === 0 ? extraArgs : [])].join(' ') : '');
+      extraArgs = [];
+      continue;
+    }
+    return [...toks, ...extraArgs];
+  }
+  throw new Error('Alias recursion too deep (max 10).');
+}
+async function cmdMacro(rest) {
+  if (wantsHelp(rest) || rest.length === 0) { console.log('Usage: ducgo macro set <name> <cmd1; cmd2; ...> | ducgo macro list | ducgo macro run <name> | ducgo macro remove <name>'); return; }
+  const sub = rest[0];
+  const tail = rest.slice(1);
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const cfg = loadConfig(dataDir);
+  if (!cfg.macros) cfg.macros = {};
+  if (sub === 'set') {
+    const mname = tail[0];
+    const body = tail.slice(1).join(' ').trim();
+    if (!mname || !body) fail('Usage: ducgo macro set <name> <cmd1; cmd2; ...>');
+    if (!isValidExtraName(mname)) fail(`Invalid macro name: "${mname}" (use letters/numbers/_/-)`);
+    if (aliasTargetBlocked(mname)) fail(`Macro name collides with a built-in: ${mname}`);
+    try {
+      const loaded = await loadPlugins(dataDir);
+      if (loaded.cmdMap.has(mname)) fail(`Macro name collides with a plugin command: ${mname}`);
+    } catch { /* ignore */ }
+    if (cfg.aliases && cfg.aliases[mname] !== undefined) fail(`Macro name collides with an alias: ${mname}`);
+    const parts = body.split(';').map((s) => s.trim()).filter(Boolean);
+    if (parts.length === 0) fail('Macro must contain at least one command.');
+    if (parts.length > 20) fail('Macro too long (max 20 commands).');
+    cfg.macros[mname] = parts.join('; ');
+    saveConfig(dataDir, cfg);
+    ui.ok(`Macro set: ${mname} (${parts.length} command(s))`);
+    return;
+  }
+  if (sub === 'list') {
+    const keys = Object.keys(cfg.macros);
+    if (keys.length === 0) { ui.dim('No macros. Use "ducgo macro set <name> <cmd1; cmd2>".'); return; }
+    console.log(ui.table(['MACRO', 'COMMANDS'], keys.sort().map((k) => [k, cfg.macros[k]])));
+    return;
+  }
+  if (sub === 'run') {
+    const mname = firstPositional(tail);
+    if (!mname) fail('Usage: ducgo macro run <name>');
+    if (cfg.macros[mname] === undefined) fail(`No such macro: ${mname}`);
+    const lines = String(cfg.macros[mname]).split(';').map((s) => s.trim()).filter(Boolean);
+    for (const line of lines) {
+      try {
+        await dispatchExpandedLine(line);
+      } catch (e) {
+        if (e instanceof ReplExit) {
+          if (replActive) {
+            ui.err(`Macro "${mname}" line failed (continuing per-line in REPL): ${line}`);
+            continue;
+          }
+          process.exit(e.code ?? 1);
+        }
+        if (replActive) {
+          console.error(`Error: ${String((e && e.message) || e)}`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    return;
+  }
+  if (sub === 'remove') {
+    const mname = firstPositional(tail);
+    if (!mname) fail('Usage: ducgo macro remove <name>');
+    if (cfg.macros[mname] === undefined) fail(`No such macro: ${mname}`);
+    delete cfg.macros[mname];
+    saveConfig(dataDir, cfg);
+    ui.ok(`Macro removed: ${mname}`);
+    return;
+  }
+  fail('Usage: ducgo macro set|list|run|remove ...');
+}
+// Dispatch one already-split macro line through the full pipeline
+// (built-ins + extras + plugins + aliases). Used by `macro run`.
+async function dispatchExpandedLine(line) {
+  let tokens;
+  try { tokens = splitReplLine(line); } catch (e) { ui.err(String((e && e.message) || e)); if (!replActive) process.exit(1); return; }
+  if (tokens.length === 0) return;
+  await dispatchTokens(tokens[0], tokens.slice(1));
 }
 
 // ================= SYSTEM =================
@@ -1248,6 +1918,7 @@ async function cmdCommands(rest) {
   if (hasFlag(rest, ['--count'])) { console.log(String(COMMANDS.length)); return; }
   if (wantsHelp(rest)) { console.log('Usage: ducgo commands [--count]'); return; }
   printGroupedCommands();
+  await printExtrasFooter();
 }
 async function cmdDoctor(rest) {
   if (wantsHelp(rest)) return cmdUsage('doctor');
@@ -1394,6 +2065,9 @@ async function cmdSupport(rest) {
 
 // Command dispatch table (exactly 70 entries). Shared by one-shot mode and
 // the interactive REPL so both modes run the SAME handler path.
+// NOTE: extras (plugin mgmt, completion, alias, macro, __complete) plus
+// plugin/alias/macro expansions live OUTSIDE this table so the 70 contract
+// (`commands --count` -> 70) never breaks. See EXTRA_HANDLERS + dispatchTokens.
 const HANDLERS = {
   setup: cmdSetup, 'login-test': cmdLoginTest, 'change-pin': cmdChangePin, 'change-duress': cmdChangeDuress,
   'lock-status': cmdLockStatus, 'auth-status': cmdAuthStatus, 'reset-all': cmdResetAll,
@@ -1414,12 +2088,74 @@ const HANDLERS = {
   'log-path': cmdLogPath, sysinfo: cmdSysinfo, uptime: cmdUptime, tips: cmdTips, license: cmdLicense,
   'verify-install': cmdVerifyInstall, paths: cmdPaths, stats: cmdStats, support: cmdSupport,
 };
+// Extra dispatch table (NEVER counted in the 70). 9 visible extras + 1 hidden.
+const EXTRA_HANDLERS = {
+  'plugin-add': cmdPluginAdd, 'plugin-enable': cmdPluginEnable, 'plugin-disable': cmdPluginDisable,
+  'plugin-list': cmdPluginList, 'plugin-show': cmdPluginShow, 'plugin-remove': cmdPluginRemove,
+  completion: cmdCompletion, alias: cmdAlias, macro: cmdMacro, '__complete': cmdCompleteHidden,
+};
+// Unified dispatch: built-ins (70) -> extras -> enabled plugin commands ->
+// aliases (with depth-10/cycle guard) -> macros (direct name runs macro).
+// Throws/calls process.exit(1) on unknown (one-shot) or per-line error (REPL).
+async function dispatchTokens(cmd, rest) {
+  const fn = HANDLERS[cmd];
+  if (fn) { await fn(rest); return; }
+  const exfn = EXTRA_HANDLERS[cmd];
+  if (exfn) { await exfn(rest); return; }
+  // Enabled plugin commands (loaded fresh each dispatch; broken -> warning + unknown).
+  try {
+    const loaded = await loadPlugins(getDataDir());
+    if (loaded.cmdMap.has(cmd)) { await runPluginCommand(cmd, rest); return; }
+  } catch (e) {
+    // loadPlugins already warned; unknown-command path below still applies.
+    void e;
+  }
+  // Aliases (never counted). Extra CLI args append to the expansion.
+  try {
+    const cfg = loadConfig(getDataDir());
+    if (cfg.aliases && cfg.aliases[cmd] !== undefined) {
+      let expanded;
+      try { expanded = resolveAliasTokens(cmd, rest); }
+      catch (e) { fail(String((e && e.message) || e)); }
+      await dispatchTokens(expanded[0], expanded.slice(1));
+      return;
+    }
+    // Macros invokable directly by name (equivalent to `macro run <name>`).
+    if (cfg.macros && cfg.macros[cmd] !== undefined) {
+      await cmdMacro(['run', cmd]);
+      return;
+    }
+  } catch (e) {
+    if (e instanceof ReplExit) throw e;
+    // resolveAliasTokens cycle errors already exited via fail(); other errors:
+    if (String((e && e.message) || e).includes('Alias cycle') || String((e && e.message) || e).includes('recursion')) {
+      fail(String((e && e.message) || e));
+    }
+    // fall through to unknown for other config read issues
+  }
+  // Unknown: error + up to 5 suggestions (built-ins + extras + plugins + aliases + macros).
+  ui.err(`Unknown command: ${cmd}`);
+  try {
+    const sug = suggestCommands(cmd);
+    if (sug.length > 0) console.log(ui.dim(`Did you mean: ${sug.join(', ')}?`));
+  } catch { /* ignore */ }
+  if (replActive) {
+    // REPL: per-line error only, shell survives (no grouped dump here).
+    process.exit(1);
+  }
+  // One-shot: full grouped list + extras footer, then exit 1 (unchanged behavior + footer).
+  console.error('');
+  printGroupedCommands();
+  try { await printExtrasFooter(); } catch { /* ignore */ }
+  process.exit(1);
+}
 
 // ================= INTERACTIVE SHELL =================
 // Bare `ducgo` (no arguments) enters a persistent REPL instead of printing
 // help-and-exit. Every line is parsed quote-aware and dispatched through the
 // SAME handlers as one-shot mode, so behavior (incl. auth/duress) is identical.
-// No new user-facing commands: the registry stays exactly 70.
+// The registry stays exactly 70 built-ins; extras (plugins/aliases/macros +
+// plugin-mgmt/completion) ride dispatchTokens + footer and are never counted.
 export function splitReplLine(line) {
   const out = [];
   let cur = '';
@@ -1458,7 +2194,9 @@ function editDistance(a, b) {
   return dp[m][n];
 }
 function suggestCommands(name) {
-  const scored = COMMAND_NAMES.map((c) => {
+  let pool = [...COMMAND_NAMES, ...EXTRA_BUILTIN_NAMES];
+  try { pool = allCompletionNamesSync(getDataDir()); } catch { /* fall back */ }
+  const scored = [...new Set(pool)].map((c) => {
     let bonus = 0;
     if (c.startsWith(name)) bonus = -100;
     else if (c.includes(name)) bonus = -50;
@@ -1488,7 +2226,9 @@ function appendReplHistory(historyFile, line) {
   } catch { /* history is best-effort; never break the shell */ }
 }
 // One REPL line, dispatched through the SAME handlers as one-shot mode.
-// Returns 'quit' when the shell should close, 'more' otherwise.
+// Covers built-ins (70) + extras + enabled plugin commands + aliases/macros.
+// `help <name>` shows origin/expansion for plugin/alias/macro. Returns 'quit'
+// when the shell should close, 'more' otherwise.
 async function replHandleLine(rawLine, ctx) {
   const { rl, historyFile, realExit } = ctx;
   const trimmed = rawLine.trim();
@@ -1505,17 +2245,10 @@ async function replHandleLine(rawLine, ctx) {
   const rest = tokens.slice(1);
   if (cmd === 'exit' || cmd === 'quit' || cmd === 'q') return 'quit';
   appendReplHistory(historyFile, trimmed);
-  const fn = HANDLERS[cmd];
-  if (!fn) {
-    ui.err(`Unknown command: ${cmd}`);
-    const sug = suggestCommands(cmd);
-    if (sug.length > 0) console.log(ui.dim(`Did you mean: ${sug.join(', ')}?`));
-    return 'more';
-  }
   replSawDuress = false;
   process.exit = ((code) => { throw new ReplExit(code); });
   try {
-    await fn(rest);
+    await dispatchTokens(cmd, rest);
   } catch (e) {
     if (e instanceof ReplExit) {
       if (e.code === 0 && replSawDuress) {
@@ -1565,8 +2298,10 @@ async function runRepl() {
     historySize: 500,
     completer: (line) => {
       const t = line.trim();
-      const hits = COMMAND_NAMES.filter((c) => c.startsWith(t));
-      return [hits.length > 0 ? hits : COMMAND_NAMES.slice(), line];
+      let pool = [...COMMAND_NAMES, ...EXTRA_BUILTIN_NAMES];
+      try { pool = allCompletionNamesSync(getDataDir()); } catch { /* fall back */ }
+      const hits = [...new Set(pool)].filter((c) => c.startsWith(t)).sort();
+      return [hits.length > 0 ? hits : [...new Set(pool)].sort(), line];
     },
   });
   replActive = true;
@@ -1650,13 +2385,7 @@ async function main() {
   if (cmd === '--version' || cmd === '-V') { console.log(`ducgo v${VERSION}`); return; }
   if (cmd === 'help') { await cmdHelp(rest); return; }
   if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
-  const fn = HANDLERS[cmd];
-  if (!fn) {
-    console.error(`Unknown command: ${cmd}\n`);
-    printGroupedCommands();
-    process.exit(1);
-  }
-  await fn(rest);
+  await dispatchTokens(cmd, rest);
 }
 
 await (async () => {
