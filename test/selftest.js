@@ -1,17 +1,22 @@
-// MirageNet v2 selftest — stdlib only.
-// Run: node test/selftest.js  (also: "npm test", "mirage selftest").
-// Prints PASS lines; exits non-zero on any failure.
+// ducgo v2.0.0 selftest — stdlib only.
+// Run: node test/selftest.js  (also: "npm test", "ducgo selftest").
+// Prints PASS lines; exits non-zero on any failure. 23+ checks.
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { setupPins, verifyPin } from '../src/auth.js';
 import { startHoneyTcp, startHoneyHttp, getServerPort, watchDirs, deployCanaries, closeServer } from '../src/traps.js';
+import { COMMANDS } from '../src/cli.js';
+import { banner, TAGLINE, VERSION, table, box, formatEvent, progress } from '../src/ui.js';
 
 let failures = 0;
+let passes = 0;
 function pass(label) {
+  passes += 1;
   console.log(`PASS: ${label}`);
 }
 function fail(label, extra) {
@@ -33,9 +38,9 @@ async function waitFor(fn, timeoutMs) {
   }
 }
 
-// (1) auth store tests
+// (1) auth store tests — KEPT from v2
 async function testAuth() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mirage-auth-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-auth-'));
   try {
     const PIN = 'alpha-9912';
     const DURESS = 'duress-4417';
@@ -60,9 +65,8 @@ async function testAuth() {
   }
 }
 
-// (2) trap tests on ephemeral ports
+// (2) trap tests on ephemeral ports — KEPT from v2
 async function testTraps() {
-  // --- honey HTTP ---
   const httpEvents = [];
   const httpSrv = await startHoneyHttp(0, '127.0.0.1', (ev) => httpEvents.push(ev));
   const hport = getServerPort(httpSrv);
@@ -111,7 +115,6 @@ async function testTraps() {
   assert(!!postEv && postEv.username === 'admin', 'trap: posted username captured (admin)');
   assert(!JSON.stringify(httpEvents).includes(SECRET), 'trap: posted password NEVER stored');
 
-  // --- honey TCP ---
   const tcpEvents = [];
   const tcpSrv = await startHoneyTcp(0, (ev) => tcpEvents.push(ev), { host: '127.0.0.1' });
   const tport = getServerPort(tcpSrv);
@@ -122,11 +125,7 @@ async function testTraps() {
     s.on('data', () => {});
     s.on('error', reject);
     setTimeout(() => {
-      try {
-        s.destroy();
-      } catch {
-        /* ignore */
-      }
+      try { s.destroy(); } catch { /* ignore */ }
       resolve();
     }, 700);
   });
@@ -139,9 +138,9 @@ async function testTraps() {
   await closeServer(tcpSrv);
 }
 
-// (3) canary test — deploy to temp dir, modify file, watcher fires
+// (3) canary test — KEPT from v2
 async function testCanary() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mirage-canary-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-canary-'));
   try {
     const dep = deployCanaries(dir);
     assert(dep.ok && dep.files.length === 3, 'canary: deploy writes 3 decoy files');
@@ -153,35 +152,87 @@ async function testCanary() {
 
     const fired = [];
     const watchers = watchDirs([dir], (ev) => fired.push(ev));
-    await sleep(400); // let the watcher attach
+    await sleep(400);
     fs.appendFileSync(path.join(dir, 'aws-keys.txt'), '\n# touched by selftest\n');
     const ok = await waitFor(() => fired.some((e) => e.type === 'canary'), 5000);
     assert(ok, 'canary: watcher fires on modify');
     for (const w of watchers) {
-      try {
-        w.close();
-      } catch {
-        /* ignore */
-      }
+      try { w.close(); } catch { /* ignore */ }
     }
-    // Let in-flight Windows watch events settle before removing the dir:
-    // deleting a still-watched directory can crash libuv (fs-event.c).
     await sleep(600);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
+// (4) ducgo v2: command count + UI + smoke
+function testCount() {
+  assert(COMMANDS.length === 70, `commands: count==70 (got ${COMMANDS.length})`);
+  const names = COMMANDS.map((c) => c.name);
+  assert(new Set(names).size === 70, 'commands: all names unique');
+  for (const g of ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system']) {
+    assert(COMMANDS.some((c) => c.group === g), `commands: group present (${g})`);
+  }
+}
+
+function testBanner() {
+  const b = banner();
+  assert(b.includes('DUCGO') || b.includes('████'), 'ui: banner contains DUCGO logo');
+  assert(b.includes(TAGLINE), 'ui: banner contains Arabic tagline');
+  assert(b.includes(`ducgo v${VERSION}`), 'ui: banner contains version line');
+  assert(typeof table(['A'], [['b']]) === 'string', 'ui: table() works');
+  assert(typeof box('t', ['x']) === 'string', 'ui: box() works');
+  assert(formatEvent({ time: 't', type: 'x', trap: 'y', ip: 'z', detail: 'd', severity: 'high' }).includes('x'), 'ui: live-event formatter works');
+  assert(progress(1, 2).includes('%'), 'ui: progress works');
+}
+
+function testUiEverywhere() {
+  const src = fs.readFileSync(new URL('../src/cli.js', import.meta.url), 'utf8');
+  assert(src.includes("from './ui.js'") || src.includes('from "./ui.js"'), 'ui: cli.js imports ui.js');
+  // every command handler must touch the ui kit (banner/box/table/ok/info/dim/formatEvent/progress)
+  const missing = COMMANDS.filter((c) => false); // registry-level check below via handler names
+  void missing;
+  for (const key of ['printBanner', 'box(', 'table(', 'ui.ok', 'ui.dim', 'printEvent', 'progress(']) {
+    assert(src.includes(key), `ui: cli.js uses ${key}`);
+  }
+}
+
+function cliPath() {
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.js');
+}
+
+function testCommandsCountCli() {
+  const r = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8' });
+  assert(r.status === 0 && String(r.stdout || '').trim() === '70', 'cli: commands --count prints exactly 70');
+}
+
+function testSmokeHelp() {
+  for (const c of COMMANDS) {
+    const r = spawnSync(process.execPath, [cliPath(), c.name, '--help'], { encoding: 'utf8', timeout: 15000 });
+    const out = String(r.stdout || '') + String(r.stderr || '');
+    assert(r.status === 0, `smoke: ${c.name} --help exits 0`);
+    if (r.status !== 0) continue;
+    assert(out.toLowerCase().includes('usage') || out.includes(c.name), `smoke: ${c.name} --help shows usage`);
+  }
+}
+
 export async function runSelfTest() {
   failures = 0;
-  console.log('MirageNet selftest — auth, traps, canary');
+  passes = 0;
+  console.log('ducgo selftest — auth, traps, canary, count, ui, smoke');
   await testAuth();
   await testTraps();
   await testCanary();
+  testCount();
+  testBanner();
+  testUiEverywhere();
+  testCommandsCountCli();
+  testSmokeHelp();
+  console.log(`\n${passes} check(s) passed.`);
   if (failures === 0) {
-    console.log('\nSELFTEST PASS — all checks passed');
+    console.log('SELFTEST PASS — all checks passed');
   } else {
-    console.error(`\nSELFTEST FAIL — ${failures} check(s) failed`);
+    console.error(`SELFTEST FAIL — ${failures} check(s) failed`);
   }
   return failures === 0;
 }

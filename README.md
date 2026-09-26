@@ -1,4 +1,4 @@
-# MirageNet v2 — Deception Tripwire Mesh (CLI only)
+# ducgo v2.0.0 — Deception Tripwire Mesh (CLI only)
 
 A lightweight **passive deception (tripwire)** tool for individuals and small teams:
 honey TCP ports, a honey HTTP admin panel, and canary files. Any touch of a trap
@@ -9,8 +9,23 @@ is logged as an event with the visitor's fingerprint. Includes duress-PIN mode
 > ports, serves a fake login page, and watches files. It never scans, probes,
 > or attacks anything.
 
-English only. CLI only. **Zero runtime dependencies** (Node.js standard library
-only). Exit codes: `0` success, `1` error.
+English only (output). CLI only. **Zero runtime dependencies** (Node.js standard
+library only — hand-rolled args, minimal ANSI colors with `NO_COLOR` support).
+Exit codes: `0` success, `1` error. No daemon/background mode — `start` runs
+foreground only until `Ctrl+C`.
+
+```
+██████╗ ██╗   ██╗ ██████╗  ██████╗  ██████╗
+██╔══██╗██║   ██║██╔════╝ ██╔════╝ ██╔═══██╗
+██║  ██║██║   ██║██║  ███╗██║  ███╗██║   ██║
+██║  ██║██║   ██║██║   ██║██║   ██║██║   ██║
+██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝
+╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝
+لا يستطيع احد سباقي
+ducgo v2.0.0
+```
+
+(The dim line above is the Arabic tagline — the only non-English output.)
 
 ## Install
 
@@ -18,103 +33,172 @@ Requires Node.js 18+.
 
 ```powershell
 cd "C:\Users\LORD laptop\Documents\MirageNet"
-npm link        # exposes the global `mirage` command
-```
-
-Or run without installing:
-
-```powershell
 node src/cli.js --help
 ```
 
-Set `NO_COLOR=1` to disable ANSI colors.
+The bin is `ducgo` (`./src/cli.js`, shebang kept). Do NOT `npm link` — running
+`node src/cli.js` is sufficient.
 
-## Commands
+Set `NO_COLOR=1` to disable ANSI colors (plain logo; tagline + version still shown).
 
-All commands store data in `%USERPROFILE%\.miragenet\`
-(`auth.json`, `events.jsonl`, `config.json`). Set `MIRAGENET_DIR` to override
-the data directory (used for testing).
+## Data
 
-### `mirage setup`
+Data dir stays `%USERPROFILE%\.miragenet\` (`auth.json`, `events.jsonl`,
+`config.json`). Set `MIRAGENET_DIR` to override the data directory (used for
+testing so you never touch the real store).
 
-Interactive first-run setup. Sets an access PIN (min 6 chars) and a **different**
-duress PIN (min 6 chars). Only salted PBKDF2-SHA256 hashes (200k iterations,
-random 16-byte salts) are stored — never any PIN material.
-
-```powershell
-mirage setup
-```
-
-### `mirage start [--ports 2222,2323,8080] [--http 18080]`
-
-Prompts for the PIN first, then arms the trap mesh live until `Ctrl+C`:
-
-- **(a) Honey TCP listeners** (default `2222,2323,8080`, LAN-visible `0.0.0.0`
-  by design). Each connection logs `{time, trap, remoteIP, remotePort,
-  bannerBytes up to 256B}`, serves a fake banner, and is closed after 5s.
-- **(b) Honey HTTP** on `127.0.0.1` (default `18080`) serving a fake
-  "Admin Login" page. Each request logs `{time, ip, method, path, userAgent,
-  loginAttempted, username?}`. **Posted passwords are never logged or stored.**
-- **(c) Canary watch** on all deployed directories (`fs.watch` → modify/rename
-  events).
-
-Events print live, color-coded by severity, and every event is appended to
-`events.jsonl`.
+## Quick start
 
 ```powershell
-mirage start
-mirage start --ports 2222,2323 --http 18080
+node src/cli.js setup
+node src/cli.js deploy ./decoys
+node src/cli.js start
+node src/cli.js events
+node src/cli.js attackers
 ```
 
-### `mirage deploy <dir>`
-
-Prompts for the PIN, drops three realistic decoys (`aws-keys.txt`,
-`passwords.csv`, `wallet-seed.txt`, each with a random `MIRAGETOKEN-*` canary
-marker) into `<dir>`, and adds the directory to the watch list in
-`config.json`.
+With a scratch dir for safe experiments:
 
 ```powershell
-mirage deploy ./decoys
+$env:MIRAGENET_DIR = "$env:TEMP\ducgo-test"
+"alpha-9912`nalpha-9912`nduress-4417`nduress-4417" | node src/cli.js setup
+node src/cli.js demo
+"alpha-9912" | node src/cli.js deploy "$env:TEMP\ducgo-test\decoys"
+node src/cli.js commands --count   # → 70
 ```
 
-### `mirage events [--json] [--export out.csv]`
+## 70 commands
 
-Prompts for the PIN, then shows history: a table by default, raw JSON with
-`--json`, or a CSV export with `--export`.
+`ducgo commands` prints the grouped list. `ducgo commands --count` prints `70`.
+Every command supports `--help` (exits 0, no side effects).
+
+### auth (7)
+
+| Command | Description |
+|---|---|
+| `setup` | Set access PIN + duress PIN (interactive, min 6 chars) |
+| `login-test` | Verify a PIN without revealing which one |
+| `change-pin` | Change the access PIN (needs current PIN) |
+| `change-duress` | Change the duress PIN (needs current PIN) |
+| `lock-status` | Show whether auth is set up (no PIN) |
+| `auth-status` | Whoami-style auth state + data dir (no PIN) |
+| `reset-all` | Delete auth (PIN + double `RESET` confirmation) |
 
 ```powershell
-mirage events
-mirage events --json
-mirage events --export report.csv
+node src/cli.js setup
+"alpha-9912" | node src/cli.js login-test
+"alpha-9912" | node src/cli.js change-pin
 ```
 
-### `mirage attackers`
+### engine (4)
 
-Prompts for the PIN, then groups touches by IP: touches, first/last seen,
-top trap.
+| Command | Description |
+|---|---|
+| `start [--ports P,...] [--http PORT]` | Unlock with PIN, run the trap mesh foreground until `Ctrl+C` (honey TCP on `0.0.0.0` + honey HTTP on `127.0.0.1` + canary watch) |
+| `status` | Check which configured ports are listening |
+| `ports-list` | List configured honey ports |
+| `engine-check` | Check if configured ports are free to bind |
 
 ```powershell
-mirage attackers
+"alpha-9912" | node src/cli.js start --ports 2222,2323 --http 18080
+node src/cli.js status
 ```
 
-### `mirage demo`
+Foreground only — there is no `start-bg`/daemon. `status` checks ports; stop with `Ctrl+C`.
 
-No PIN needed. Records one synthetic event labeled `DEMO` so you can review
-the output format.
+### traps (9)
 
-```powershell
-mirage demo
-```
+| Command | Description |
+|---|---|
+| `trap-list` | List honey TCP traps + enabled state |
+| `trap-add <port>` | Add a honey TCP port (needs PIN) |
+| `trap-remove <port>` | Remove a honey TCP port (needs PIN) |
+| `trap-enable <port>` | Re-enable a disabled trap (needs PIN) |
+| `trap-disable <port>` | Disable a trap without deleting it (needs PIN) |
+| `http-show` | Print the fake admin panel preview |
+| `http-config [--port N] [--title TEXT]` | Configure honey HTTP port/title (needs PIN) |
+| `banner-set <port> <text>` | Set a custom banner label for a port (needs PIN) |
+| `banner-show [port]` | Show banner for a port (or all) |
 
-### `mirage selftest` (also `npm test`)
+### canary (6)
 
-Runs the built-in suite: auth-store tests, trap tests on ephemeral ports, and
-a canary watcher test. Prints `PASS` lines; exits non-zero on failure.
+| Command | Description |
+|---|---|
+| `deploy <dir>` | Drop 3 decoys (`aws-keys.txt`, `passwords.csv`, `wallet-seed.txt` with `MIRAGETOKEN-*`) + watch the dir (needs PIN) |
+| `canary-list` | List watched dirs + decoy files present |
+| `canary-verify` | Verify decoys still carry canary tokens (needs PIN) |
+| `canary-refresh [dir]` | Regenerate/refresh decoy tokens (needs PIN) |
+| `canary-remove <dir> [--delete]` | Unwatch a dir, optionally delete decoys (needs PIN) |
+| `canary-show <file>` | Print the canary token of a file (needs PIN) |
 
-```powershell
-mirage selftest
-npm test
-```
+### events (7)
+
+| Command | Description |
+|---|---|
+| `events [--json] [--export out.csv]` | Show history (table/JSON/CSV export, needs PIN) |
+| `events-tail [--lines N] [--follow]` | Last N events, optionally follow live (needs PIN) |
+| `event-show <id>` | Show one event by id (needs PIN) |
+| `events-clear` | Clear the log (PIN + type `CLEAR`) |
+| `events-export <file> [--format csv\|json]` | Export to file (needs PIN) |
+| `events-import <file>` | Import JSON/JSONL events (needs PIN) |
+| `events-stats` | Counts by type/severity/trap (needs PIN) |
+
+### attackers (5)
+
+| Command | Description |
+|---|---|
+| `attackers` | Group touches by IP (needs PIN) |
+| `attacker-show <ip>` | Timeline for one IP (needs PIN) |
+| `attacker-note <ip> <text...>` | Attach a text note to an IP (needs PIN) |
+| `attacker-list-notes [ip]` | List notes (needs PIN) |
+| `top-attackers [--limit N]` | Top N IPs by touches (needs PIN) |
+
+### reports (4)
+
+| Command | Description |
+|---|---|
+| `report-daily` | Last-24h events, grouped (needs PIN) |
+| `report-summary` | Totals, range, severity (needs PIN) |
+| `report-top [--limit N]` | Top traps + top IPs (needs PIN) |
+| `report-export <file>` | Markdown report to file (needs PIN) |
+
+### config (8)
+
+| Command | Description |
+|---|---|
+| `config-set <key> <value>` | Set `ports\|httpPort\|httpTitle\|watchDirs` (needs PIN) |
+| `config-get <key>` | Get a key (needs PIN) |
+| `config-list` | Full config table (needs PIN) |
+| `config-reset` | Defaults (needs PIN) |
+| `data-dir` | Print the data directory path |
+| `data-size` | Print store file sizes |
+| `config-export <file>` | Export `config.json` |
+| `config-import <file>` | Import `config.json` (needs PIN) |
+
+### system (20)
+
+| Command | Description |
+|---|---|
+| `help [command]` | Banner + help (or one command's usage) |
+| `banner` | Print the DUCGO banner |
+| `version` | Print `ducgo v2.0.0` |
+| `commands [--count]` | Grouped one-liners; `--count` prints `70` |
+| `doctor` | Node/data-dir/auth/ports health checks |
+| `selftest` | Built-in suite (same as `npm test`) |
+| `demo` | One synthetic `DEMO` event (no PIN) |
+| `about` | About + honest limits |
+| `backup <file>` | Back up auth+config+events (needs PIN) |
+| `restore <file>` | Restore backup (PIN + type `RESTORE`) |
+| `wipe` | Factory reset (PIN + type `WIPE`) |
+| `log-path` | Print `events.jsonl` path |
+| `sysinfo` | Node/OS/platform info |
+| `uptime` | Process uptime + store age |
+| `tips` | Practical usage tips |
+| `license` | License summary |
+| `verify-install` | Bin/shebang/node/data-dir checks |
+| `paths` | All store paths |
+| `stats` | Global overview (needs PIN) |
+| `support` | Scope + support info |
 
 ## Duress PIN
 
@@ -156,14 +240,17 @@ The screen never reveals that duress mode was triggered.
   spoofed/internal IPs mean little on their own.
 - Duress mode hides the real view but cannot hide that the tool is installed.
 - `demo` injects a synthetic event clearly tagged `DEMO` / type `sim`.
+- Engine is foreground only (no daemon). `status`/`engine-check` inspect ports;
+  stop with `Ctrl+C`.
 
 ## Project layout
 
 ```text
-package.json        ESM ("type": "module"), bin { mirage: ./src/cli.js }, no deps
-src/cli.js          hand-rolled arg parsing, hidden PIN prompt, all commands
+package.json        ESM ("type": "module"), bin { ducgo: ./src/cli.js }, no deps
+src/cli.js          hand-rolled args, hidden PIN prompt, all 70 commands
+src/ui.js           banner/box/table/severity/ok/err/info/dim/event-format/progress (NO_COLOR aware)
 src/auth.js         PBKDF2 PIN + duress store (dataDir-injected, testable)
 src/traps.js        honey TCP / honey HTTP / canary watch / decoy deploy (stdlib only)
-src/store.js        data dir: config.json + events.jsonl
-test/selftest.js    auth + trap (ephemeral ports) + canary tests
+src/store.js        data dir: config.json + events.jsonl (+disabled/banners/notes)
+test/selftest.js    auth + traps (ephemeral) + canary + count==70 + ui + per-command --help smoke
 ```

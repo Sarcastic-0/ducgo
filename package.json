@@ -1,10 +1,10 @@
 {
-  "name": "miragenet",
+  "name": "ducgo",
   "version": "2.0.0",
-  "description": "MirageNet — passive deception tripwires (CLI only, English only, zero runtime dependencies)",
+  "description": "ducgo — passive deception tripwires (CLI only, English only, zero runtime dependencies)",
   "type": "module",
   "bin": {
-    "mirage": "./src/cli.js"
+    "ducgo": "./src/cli.js"
   },
   "scripts": {
     "test": "node test/selftest.js"
