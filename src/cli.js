@@ -692,20 +692,61 @@ function checkPortFree(port, timeoutMs = 800) {
   });
 }
 
+// Prompt + confirm with retries. On mismatch only LENGTHS are shown (never content).
+// Returns the value, or fails after attempts are exhausted.
+async function promptWithConfirm(label, confirmLabel, attempts = 3, extraCheck = null) {
+  for (let i = 1; i <= attempts; i++) {
+    const a = await promptHidden(label);
+    const b = await promptHidden(confirmLabel);
+    const alen = a ? a.length : 0;
+    const blen = b ? b.length : 0;
+    if (alen < 6) {
+      ui.err(`Too short (${alen} chars, minimum 6). Try again (attempt ${i}/${attempts}).`);
+      continue;
+    }
+    if (a !== b) {
+      ui.err(`Entries do not match (${alen} vs ${blen} chars). Try again (attempt ${i}/${attempts}).`);
+      continue;
+    }
+    if (extraCheck) {
+      const msg = extraCheck(a);
+      if (msg) {
+        ui.err(`${msg} Try again (attempt ${i}/${attempts}).`);
+        continue;
+      }
+    }
+    return a;
+  }
+  fail('Too many mismatched attempts. Run "ducgo setup" again when ready.');
+}
+
 // ================= AUTH =================
 async function cmdSetup(rest) {
   if (wantsHelp(rest)) return cmdUsage('setup');
   const dataDir = getDataDir();
   ui.info(`Data directory: ${dataDir}`);
   if (isSetup(dataDir)) fail(`Already set up (${dataDir}). Use "ducgo reset-all" to reset.`);
-  const pin = await promptHidden('Set access PIN (min 6 chars): ');
-  const pin2 = await promptHidden('Confirm access PIN: ');
-  if (!pin || pin.length < 6) fail('PIN must be at least 6 characters.');
-  if (pin !== pin2) fail('PINs do not match.');
-  const duress = await promptHidden('Set duress PIN (min 6 chars, must differ): ');
-  const duress2 = await promptHidden('Confirm duress PIN: ');
-  if (!duress || duress.length < 6) fail('Duress PIN must be at least 6 characters.');
-  if (duress !== duress2) fail('Duress PINs do not match.');
+  const envPin = process.env.DUC_PIN;
+  const envDuress = process.env.DUC_DURESS;
+  let pin;
+  let duress;
+  if (envPin !== undefined || envDuress !== undefined) {
+    // Non-interactive setup (scripting). Values are never echoed.
+    pin = envPin ?? '';
+    duress = envDuress ?? '';
+    if (!pin || pin.length < 6) fail('DUC_PIN must be at least 6 characters.');
+    if (!duress || duress.length < 6) fail('DUC_DURESS must be at least 6 characters.');
+    if (pin === duress) fail('DUC_DURESS must differ from DUC_PIN.');
+  } else {
+    ui.info('Duress PIN: a SECOND code, different from your access PIN. Used only under coercion.');
+    pin = await promptWithConfirm('Set access PIN (min 6 chars): ', 'Confirm access PIN: ');
+    duress = await promptWithConfirm(
+      'Set duress PIN (min 6 chars, must differ): ',
+      'Confirm duress PIN: ',
+      3,
+      (v) => (v === pin ? 'Duress PIN must differ from the access PIN.' : null)
+    );
+  }
   const r = setupPins(dataDir, pin, duress);
   if (!r.ok) fail(r.error || 'Setup failed.');
   ui.ok(`Setup complete. Data directory: ${dataDir}`);

@@ -59,6 +59,17 @@ node src/cli.js events
 node src/cli.js attackers
 ```
 
+`setup` asks for an access PIN and a SECOND, different duress PIN (used only
+under coercion). Each entry is confirmed: on a mismatch it shows only the
+lengths entered (never content) and retries up to 3 times instead of failing
+immediately. Non-interactive setup for scripting:
+
+```powershell
+$env:DUC_PIN = "alpha-9912"; $env:DUC_DURESS = "duress-4417"
+node src/cli.js setup
+Remove-Item Env:\DUC_PIN, Env:\DUC_DURESS   # clear secrets from the session
+```
+
 With a scratch dir for safe experiments:
 
 ```powershell
@@ -114,7 +125,7 @@ Every command supports `--help` (exits 0, no side effects).
 
 | Command | Description |
 |---|---|
-| `setup` | Set access PIN + duress PIN (interactive, min 6 chars) |
+| `setup` | Set access PIN + duress PIN (interactive with retries, or DUC_PIN/DUC_DURESS env) |
 | `login-test` | Verify a PIN without revealing which one |
 | `change-pin` | Change the access PIN (needs current PIN) |
 | `change-duress` | Change the duress PIN (needs current PIN) |

@@ -322,17 +322,66 @@ function testSmokeHelp() {
 function examplePluginPath() {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'examples', 'hello-plugin.js');
 }
-function runCli(dir, args, input) {
+function runCli(dir, args, input, extraEnv = {}) {
   return spawnSync(process.execPath, [cliPath(), ...args], {
     input: input ?? undefined,
     encoding: 'utf8',
     timeout: 15000,
-    env: { ...process.env, MIRAGENET_DIR: dir },
+    env: { ...process.env, MIRAGENET_DIR: dir, ...extraEnv },
   });
 }
 function setupScratch(dir, pin = 'alpha-9912', duress = 'duress-4417') {
   const r = runCli(dir, ['setup'], `${pin}\n${pin}\n${duress}\n${duress}\n`);
   return r;
+}
+
+// setup: mismatch retries (with lengths hint) instead of instant fail,
+// attempts exhausted exits non-zero, DUC_PIN/DUC_DURESS env path works.
+function testSetupRetry() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-setupretry-'));
+  try {
+    const r = runCli(
+      dir,
+      ['setup'],
+      'retry-111\nWRONG-222\nretry-111\nretry-111\nduress-1\nduress-1\n'
+    );
+    const out = String(r.stdout || '') + String(r.stderr || '');
+    assert(r.status === 0, 'setup: mismatch retries then succeeds', out.slice(0, 800));
+    assert(/8 vs 9 chars|do not match/i.test(out), 'setup: mismatch shows lengths hint');
+    assert(verifyPin(dir, 'retry-111') === 'normal', 'setup: retried PIN verifies');
+    assert(verifyPin(dir, 'duress-1') === 'duress', 'setup: duress verifies');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-setupexh-'));
+  try {
+    const r2 = runCli(dir2, ['setup'], 'aaaaaa\nbbbbbb\naaaaaa\nbbbbbb\naaaaaa\nbbbbbb\n');
+    const out2 = String(r2.stdout || '') + String(r2.stderr || '');
+    assert(r2.status !== 0, 'setup: 3 mismatches exits non-zero');
+    assert(/Too many mismatched attempts/i.test(out2), 'setup: exhaustion message shown');
+    assert(!fs.existsSync(path.join(dir2, 'auth.json')), 'setup: no auth file after exhaustion');
+  } finally {
+    fs.rmSync(dir2, { recursive: true, force: true });
+  }
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-setupenv-'));
+  try {
+    const r3 = runCli(dir3, ['setup'], undefined, { DUC_PIN: 'envpin-1', DUC_DURESS: 'envdur-2' });
+    const out3 = String(r3.stdout || '') + String(r3.stderr || '');
+    assert(r3.status === 0, 'setup: DUC_PIN/DUC_DURESS env path succeeds', out3.slice(0, 500));
+    assert(!out3.includes('envpin-1') && !out3.includes('envdur-2'), 'setup: env PINs never echoed');
+    assert(verifyPin(dir3, 'envpin-1') === 'normal', 'setup: env PIN verifies');
+  } finally {
+    fs.rmSync(dir3, { recursive: true, force: true });
+  }
+  const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-setupenv2-'));
+  try {
+    const r4 = runCli(dir4, ['setup'], undefined, { DUC_PIN: 'same-11', DUC_DURESS: 'same-11' });
+    const out4 = String(r4.stdout || '') + String(r4.stderr || '');
+    assert(r4.status !== 0, 'setup: env identical PINs rejected');
+    assert(/must differ/i.test(out4), 'setup: env identical PINs message');
+  } finally {
+    fs.rmSync(dir4, { recursive: true, force: true });
+  }
 }
 
 function testPluginCycle() {
@@ -834,6 +883,7 @@ export async function runSelfTest() {
   testReplPiped();
   testReplAuthPiped();
   testOneShotStillFine();
+  testSetupRetry();
   testSmokeHelp();
   testPluginCycle();
   testBrokenPlugin();
