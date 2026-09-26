@@ -1306,7 +1306,9 @@ async function main() {
 await (async () => {
   let invokedAsMain = false;
   try {
-    invokedAsMain = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+    invokedAsMain =
+      !!process.argv[1] &&
+      fs.realpathSync(path.resolve(process.argv[1])) === fileURLToPath(import.meta.url);
   } catch {
     invokedAsMain = false;
   }
