@@ -1,13 +1,15 @@
-# ducgo v2.0.0 - Deception Tripwire Mesh (CLI only)
+# ducgo v3.0.4 - Deception Tripwire Mesh + Network Sentinel (CLI only)
 
 A lightweight **passive deception (tripwire)** tool for individuals and small teams:
 honey TCP ports, a honey HTTP admin panel, and canary files. Any touch of a trap
 is logged as an event with the visitor's fingerprint. Includes duress-PIN mode
-(fake all-clear message + silent alert).
+(fake all-clear message + silent alert) plus a read-only **network sentinel**
+(baseline + diff of local tables) and **file-integrity** tripwires.
 
 > 100% passive/defensive. Zero offensive traffic - the tool only listens on
-> ports, serves a fake login page, and watches files. It never scans, probes,
-> or attacks anything.
+> ports, serves a fake login page, watches files, and reads local OS tables
+> (netstat, arp, netsh, tasklist) plus a loopback-only self-scan. It never
+> probes remote hosts, never captures packets, and never attacks anything.
 
 English only (output). CLI only. **Zero runtime dependencies** (Node.js standard
 library only - hand-rolled args, minimal ANSI colors with `NO_COLOR` support).
@@ -22,7 +24,7 @@ foreground only until `Ctrl+C`.
 ██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝╚██████╔╝
 ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝  ╚═════╝
 No one can race me
-ducgo v2.0.0
+ducgo v3.0.4
 ```
 
 (The dim line above is the English tagline.)
@@ -44,7 +46,7 @@ Set `NO_COLOR=1` to disable ANSI colors (plain logo; tagline + version still sho
 ## Data
 
 Data dir stays `%USERPROFILE%\.miragenet\` (`auth.json`, `events.jsonl`,
-`config.json`). Set `MIRAGENET_DIR` to override the data directory (used for
+`config.json`, `sentinel-baseline.json`, `integrity.json`). Set `MIRAGENET_DIR` to override the data directory (used for
 testing so you never touch the real store).
 
 ## Quick start
@@ -64,7 +66,7 @@ $env:MIRAGENET_DIR = "$env:TEMP\ducgo-test"
 "alpha-9912`nalpha-9912`nduress-4417`nduress-4417" | node src/cli.js setup
 node src/cli.js demo
 "alpha-9912" | node src/cli.js deploy "$env:TEMP\ducgo-test\decoys"
-node src/cli.js commands --count   # -> 70
+node src/cli.js commands --count   # -> 86
 ```
 
 ## Interactive shell
@@ -77,7 +79,7 @@ too: lines are executed in order and the shell exits at EOF.
 ```powershell
 node src/cli.js
 # ducgo> version
-# ducgo> commands --count   # -> 70
+# ducgo> commands --count   # -> 86
 # ducgo> attacker-note 1.2.3.4 "suspicious login"
 # ducgo> exit
 
@@ -100,12 +102,12 @@ Notes:
   shown); history persists at `<dataDir>\history` (capped at ~500 lines,
   best-effort).
 - One-shot mode (`ducgo <command> [options]`) is unchanged. The registry
-  stays exactly 70 built-ins; extras (plugin mgmt, completion, alias, macro,
+  stays exactly 86 built-ins; extras (plugin mgmt, completion, alias, macro,
   plugin commands) are never counted - see the `commands` footer line.
 
-## 70 commands
+## 86 commands
 
-`ducgo commands` prints the grouped list. `ducgo commands --count` prints `70`.
+`ducgo commands` prints the grouped list. `ducgo commands --count` prints `86`.
 Every command supports `--help` (exits 0, no side effects).
 
 ### auth (7)
@@ -217,8 +219,8 @@ Foreground only - there is no `start-bg`/daemon. `status` checks ports; stop wit
 |---|---|
 | `help [command]` | Banner + help (or one command's usage) |
 | `banner` | Print the DUCGO banner |
-| `version` | Print `ducgo v2.0.0` |
-| `commands [--count]` | Grouped one-liners; `--count` prints `70` |
+| `version` | Print `ducgo v3.0.4` |
+| `commands [--count]` | Grouped one-liners; `--count` prints `86` |
 | `doctor` | Node/data-dir/auth/ports health checks |
 | `selftest` | Built-in suite (same as `npm test`) |
 | `demo` | One synthetic `DEMO` event (no PIN) |
@@ -235,6 +237,67 @@ Foreground only - there is no `start-bg`/daemon. `status` checks ports; stop wit
 | `paths` | All store paths |
 | `stats` | Global overview (needs PIN) |
 | `support` | Scope + support info |
+
+### sentinel (11)
+
+Read-only network watch (stdlib only - `child_process` + `net` + `dns`,
+no packet capture). Every spawned OS command is killed after 8s with a clean
+error. Only the tool data dir is ever written (baselines + `sentinel` events).
+All commands need the normal PIN (duress sees the all-clear only).
+
+| Command | Description |
+|---|---|
+| `listen [--interval 10] [--duration 0]` | Live watch until `Ctrl+C` (0 = forever); diffs quick tables vs baseline, color alerts + logs `sentinel` events; first run auto-creates the baseline |
+| `sentinel-baseline` | Save a full baseline (netstat + arp + wifi + hosts + dns + loopback scan) |
+| `sentinel-check` | One-shot diff vs baseline + threat score (logs one `sentinel` event) |
+| `sentinel-report` | Summary of recent `sentinel` events |
+| `open-ports` | Self-scan common ports on `127.0.0.1` (short timeout) + `netstat` listeners |
+| `conn-summary` | Established TCP grouped by remote IP:port + PID/process via `tasklist` |
+| `arp-watch` | Parse `arp -a`; flag new IPs / changed MACs vs baseline (possible spoofing) |
+| `wifi-scan` | Parse `netsh wlan show networks mode=bssid`; flag duplicate SSIDs / new BSSIDs (possible evil twin) + open twins |
+| `hosts-verify` | Hash the hosts file vs stored baseline; alert on change |
+| `dns-check` | Resolve a fixed list via stdlib lookup; flag changes vs baseline |
+| `threat-score` | Score 0-100 from recent events with a transparent factor table |
+
+```powershell
+"alpha-9912" | node src/cli.js sentinel-baseline
+"alpha-9912" | node src/cli.js sentinel-check
+"alpha-9912" | node src/cli.js listen --interval 10 --duration 60
+"alpha-9912" | node src/cli.js threat-score
+```
+
+Honest sentinel notes (read before trusting alerts):
+
+- Heuristics only, not proof. New listeners, ARP changes, new BSSIDs, DNS
+  rotations, and hosts edits all have benign causes (updates, DHCP, mesh /
+  repeaters, CDN rotation, VPNs). Confirm unknown MACs / BSSIDs against your
+  router admin page before acting.
+- No packet capture is used or claimed. For real sniffing use a companion
+  such as Npcap / Wireshark alongside this tool.
+- `open-ports` touches `127.0.0.1` only (loopback self-check). Nothing here
+  probes remote hosts.
+- `wifi-scan` needs Windows + a WLAN adapter; on other setups it reports
+  cleanly and the parsers remain unit-tested with fixtures.
+- First `listen` / `sentinel-check` run with no baseline auto-creates one and
+  says so - re-run to get diffs.
+
+### integrity (5)
+
+File-integrity tripwires for arbitrary paths (sha256). All commands need the
+normal PIN (duress sees the all-clear only).
+
+| Command | Description |
+|---|---|
+| `integrity-add <file...>` | Start watching file(s) by hash |
+| `integrity-list` | List watched files |
+| `integrity-verify` | Report changed / missing (exits 1 on tamper) |
+| `integrity-remove <file>` | Stop watching a file |
+| `integrity-baseline-refresh` | Re-hash current files as the new baseline |
+
+```powershell
+"alpha-9912" | node src/cli.js integrity-add C:\important\notes.txt
+"alpha-9912" | node src/cli.js integrity-verify
+```
 
 ## Duress PIN
 
@@ -257,8 +320,12 @@ The screen never reveals that duress mode was triggered.
 - Honey HTTP binds `127.0.0.1` only (local review); honey TCP binds `0.0.0.0`
   **by design** so LAN touches trip the wire. Usernames from fake logins are
   logged (capped at 120 chars); passwords are never stored anywhere.
+- Sentinel is read-only: OS table reads + loopback self-scan only. Baselines
+  (`sentinel-baseline.json`, `integrity.json`) and `sentinel` events live under
+  the data dir. System state is never modified.
 - No dependencies = minimal supply-chain surface. No network calls except the
-  local listeners themselves.
+  local listeners themselves, loopback self-scan, and stdlib DNS lookups for
+  `dns-check`.
 
 ## Honest limits
 
@@ -278,6 +345,10 @@ The screen never reveals that duress mode was triggered.
 - `demo` injects a synthetic event clearly tagged `DEMO` / type `sim`.
 - Engine is foreground only (no daemon). `status`/`engine-check` inspect ports;
   stop with `Ctrl+C`.
+- Sentinel `threat-score` is a 0-100 heuristic from local events with a shown
+  factor table - not a verdict. ARP / evil-twin / DNS flags are heuristics;
+  expect false positives (DHCP, repeaters, CDN rotation). No packet capture:
+  pair with Npcap / Wireshark for real traffic review.
 
 ## Plugins (commands only)
 
@@ -317,7 +388,7 @@ node src/cli.js completion --uninstall  # remove the marked block
 ```
 
 Hidden `__complete <prefix...>` (never counted/listed) feeds the scripts
-with built-in (70) + enabled-plugin + alias + macro names.
+with built-in (86) + enabled-plugin + alias + macro names.
 
 ## Aliases + Macros (never counted)
 
@@ -337,7 +408,7 @@ Aliases have a recursion guard (depth 10, cycle -> clean error).
 Macros are `;`-separated: stop-on-first-error in one-shot mode, per-line
 (continue) in REPL.
 
-The 70 contract: `commands --count` stays exactly 70. Extras
+The 86 contract: `commands --count` stays exactly 86. Extras
 (plugin commands, aliases, macros, plus 9 extra built-ins) appear only in
 the footer line (`+ N plugin command(s), ...`) and are never counted.
 
@@ -345,11 +416,12 @@ the footer line (`+ N plugin command(s), ...`) and are never counted.
 
 ```text
 package.json        ESM ("type": "module"), bin { ducgo: ./src/cli.js }, no deps
-src/cli.js          hand-rolled args, hidden PIN prompt, 70 built-ins + extras (plugins/completion/alias/macro, never counted)
+src/cli.js          hand-rolled args, hidden PIN prompt, 86 built-ins + extras (plugins/completion/alias/macro, never counted)
 src/ui.js           banner/box/table/severity/ok/err/info/dim/event-format/progress (NO_COLOR aware)
 src/auth.js         PBKDF2 PIN + duress store (dataDir-injected, testable)
 src/traps.js        honey TCP / honey HTTP / canary watch / decoy deploy (stdlib only)
-src/store.js        data dir: config.json (now +plugins/aliases/macros) + events.jsonl (+disabled/banners/notes)
+src/sentinel.js     read-only network watch parsers + baselines + threat score + integrity (stdlib only, no capture)
+src/store.js        data dir: config.json (now +plugins/aliases/macros) + events.jsonl (+disabled/banners/notes) + sentinel-baseline.json + integrity.json
 examples/hello-plugin.js   example plugin (commands hello, threat-tip) used by tests
-test/selftest.js    auth + traps (ephemeral) + canary + count==70 + ui + per-command --help smoke + plugins/completion/alias/macro
+test/selftest.js    auth + traps (ephemeral) + canary + count==86 + ui + per-command --help smoke + plugins/completion/alias/macro + sentinel/integrity
 ```

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ducgo v2.0.0 - English-only, CLI-only passive deception tripwires.
+// ducgo v3.0.4 - English-only, CLI-only passive deception tripwires.
 // Node.js stdlib ONLY. Zero runtime dependencies. Exit codes: 0 ok, 1 error.
 // Data dir stays %USERPROFILE%\.miragenet (MIRAGENET_DIR overrides for tests).
 import * as fs from 'node:fs';
@@ -42,11 +42,12 @@ import {
   FAKE_LOGIN_PAGE,
 } from './traps.js';
 import * as ui from './ui.js';
+import * as sentinel from './sentinel.js';
 
-const VERSION = '2.0.0';
+const VERSION = '3.0.4';
 const DURESS_MESSAGE = 'All clear - no threats detected.';
 
-// ---------- command registry (exactly 70) ----------
+// ---------- command registry (exactly 86: 70 original + 11 sentinel + 5 integrity) ----------
 export const COMMANDS = [
   // auth (7)
   { name: 'setup', group: 'auth', desc: 'Set access PIN + duress PIN (interactive)', usage: 'ducgo setup' },
@@ -127,14 +128,32 @@ export const COMMANDS = [
   { name: 'paths', group: 'system', desc: 'Print all store paths', usage: 'ducgo paths' },
   { name: 'stats', group: 'system', desc: 'Global overview (events/attackers/traps)', usage: 'ducgo stats' },
   { name: 'support', group: 'system', desc: 'Support + scope info', usage: 'ducgo support' },
+  // sentinel (11) - proactive read-only network watch (stdlib only, no packet capture)
+  { name: 'listen', group: 'sentinel', desc: 'Watch network tables live until Ctrl+C (needs PIN)', usage: 'ducgo listen [--interval 10] [--duration 0]' },
+  { name: 'sentinel-baseline', group: 'sentinel', desc: 'Save a network baseline snapshot (needs PIN)', usage: 'ducgo sentinel-baseline' },
+  { name: 'sentinel-check', group: 'sentinel', desc: 'One-shot diff vs baseline + score (needs PIN)', usage: 'ducgo sentinel-check' },
+  { name: 'sentinel-report', group: 'sentinel', desc: 'Summary of recent sentinel events (needs PIN)', usage: 'ducgo sentinel-report' },
+  { name: 'open-ports', group: 'sentinel', desc: 'Self-scan loopback ports + list listeners (needs PIN)', usage: 'ducgo open-ports' },
+  { name: 'conn-summary', group: 'sentinel', desc: 'Established connections grouped by remote (needs PIN)', usage: 'ducgo conn-summary' },
+  { name: 'arp-watch', group: 'sentinel', desc: 'Show ARP table, flag MAC changes (needs PIN)', usage: 'ducgo arp-watch' },
+  { name: 'wifi-scan', group: 'sentinel', desc: 'Show nearby Wi-Fi, flag evil-twin signs (needs PIN)', usage: 'ducgo wifi-scan' },
+  { name: 'hosts-verify', group: 'sentinel', desc: 'Verify hosts file hash vs baseline (needs PIN)', usage: 'ducgo hosts-verify' },
+  { name: 'dns-check', group: 'sentinel', desc: 'Resolve fixed hosts, flag changes vs baseline (needs PIN)', usage: 'ducgo dns-check' },
+  { name: 'threat-score', group: 'sentinel', desc: 'Score 0-100 from recent events + factors (needs PIN)', usage: 'ducgo threat-score' },
+  // integrity (5) - file-integrity tripwires for arbitrary paths (sha256)
+  { name: 'integrity-add', group: 'integrity', desc: 'Watch a file by sha256 hash (needs PIN)', usage: 'ducgo integrity-add <file...>' },
+  { name: 'integrity-list', group: 'integrity', desc: 'List watched integrity files (needs PIN)', usage: 'ducgo integrity-list' },
+  { name: 'integrity-verify', group: 'integrity', desc: 'Verify watched files (changed/missing) (needs PIN)', usage: 'ducgo integrity-verify' },
+  { name: 'integrity-remove', group: 'integrity', desc: 'Stop watching a file (needs PIN)', usage: 'ducgo integrity-remove <file>' },
+  { name: 'integrity-baseline-refresh', group: 'integrity', desc: 'Re-hash current files as new baseline (needs PIN)', usage: 'ducgo integrity-baseline-refresh' },
 ];
 export const COMMAND_NAMES = COMMANDS.map((c) => c.name);
 export const COMMAND_COUNT = COMMANDS.length;
 
-// ---------- extras (NEVER counted in the 70 contract) ----------
+// ---------- extras (NEVER counted in the 86 contract) ----------
 // Built-in extras: plugin management (6) + completion + alias + macro = 9,
 // plus hidden __complete. None of these live in COMMANDS, so
-// `commands --count` stays exactly 70. They are listed only in the footer
+// `commands --count` stays exactly 86. They are listed only in the footer
 // line (`+ N plugin command(s), ...`) and via __complete/REPL completer.
 // Plugins may ONLY add commands - they may NOT hook the trap engine or auth.
 export const EXTRA_BUILTINS = [
@@ -513,7 +532,7 @@ async function requireAuth(dataDir) {
 function printGroupedCommands() {
   ui.printBanner();
   console.log('');
-  const groups = ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system'];
+  const groups = ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system', 'sentinel', 'integrity'];
   for (const g of groups) {
     console.log(ui.bold(`[${g}]`));
     for (const c of COMMANDS.filter((x) => x.group === g)) {
@@ -540,7 +559,7 @@ async function printExtrasFooter() {
       }
     }
     const extraBuiltinCount = EXTRA_BUILTIN_NAMES.length;
-    console.log(ui.dim(`+ ${pluginCmdCount} plugin command(s), ${aliasNames.length} alias(es), ${macroNames.length} macro(s), ${extraBuiltinCount} extra command(s) (extras never counted in the 70)`));
+    console.log(ui.dim(`+ ${pluginCmdCount} plugin command(s), ${aliasNames.length} alias(es), ${macroNames.length} macro(s), ${extraBuiltinCount} extra command(s) (extras never counted in the 86)`));
     if (pluginCmdCount > 0 || aliasNames.length > 0 || macroNames.length > 0) {
       ui.dim('Extras: plugin commands run with group plugin-cmd; aliases/macros expand locally. Try "ducgo help <name>".');
     }
@@ -560,7 +579,7 @@ function printHelp() {
   console.log('  ducgo events             Review recorded touches');
   console.log('  ducgo attackers          Group touches by IP');
   console.log('');
-  console.log(ui.bold('Groups: auth(7) engine(4) traps(9) canary(6) events(7) attackers(5) reports(4) config(8) system(20) = 70'));
+  console.log(ui.bold('Groups: auth(7) engine(4) traps(9) canary(6) events(7) attackers(5) reports(4) config(8) system(20) sentinel(11) integrity(5) = 86'));
   console.log('Run "ducgo commands" for the full grouped list, "ducgo help <command>" for details.');
   console.log('');
   console.log(ui.dim('Duress: entering the duress PIN at any PIN prompt shows a fake all-clear and records a silent alert.'));
@@ -581,7 +600,7 @@ function cmdUsage(name) {
   if (ex) {
     ui.printBanner();
     console.log('');
-    console.log(ui.bold(`ducgo ${ex.name}`) + ` - ${ex.desc} [extra, never counted in the 70]`);
+    console.log(ui.bold(`ducgo ${ex.name}`) + ` - ${ex.desc} [extra, never counted in the 86]`);
     console.log(`Usage: ${ex.usage}`);
     return;
   }
@@ -2018,7 +2037,7 @@ async function cmdTips(rest) {
 }
 async function cmdLicense(rest) {
   if (wantsHelp(rest)) return cmdUsage('license');
-  console.log(ui.box('license', ['ducgo v2.0.0 - passive defensive tool. No warranty.', 'Zero runtime dependencies. Node.js stdlib only.', 'Use only on systems/networks you own or are authorized to defend.']));
+  console.log(ui.box('license', ['ducgo v3.0.4 - passive defensive tool. No warranty.', 'Zero runtime dependencies. Node.js stdlib only.', 'Use only on systems/networks you own or are authorized to defend.']));
 }
 async function cmdVerifyInstall(rest) {
   if (wantsHelp(rest)) return cmdUsage('verify-install');
@@ -2063,11 +2082,334 @@ async function cmdSupport(rest) {
   console.log(ui.box('support', ['scope: passive tripwires on your own machines only', 'no offensive use - this tool never scans or attacks', 'check "ducgo doctor" + "ducgo about" for limits first']));
 }
 
-// Command dispatch table (exactly 70 entries). Shared by one-shot mode and
+// ================= SENTINEL (proactive, honest, stdlib-only) =================
+// Read-only Windows queries with timeouts. No packet capture: real sniffing
+// needs a companion such as Npcap / Wireshark (see README). Every spawned OS
+// command is killed after 8s with a clean error. Only the tool data dir is
+// ever written (baselines + sentinel events). All commands need the normal
+// PIN; the duress PIN sees the all-clear only (via requireAuth).
+function sentinelOsNote() {
+  console.log(ui.dim('Read-only OS queries (netstat, arp, netsh, tasklist) + loopback self-scan only. No remote probing, no capture.'));
+}
+async function cmdListen(rest) {
+  if (wantsHelp(rest)) return cmdUsage('listen');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  let intervalSec = 10;
+  let durationSec = 0;
+  const ivRaw = takeFlagValue(rest, ['--interval']);
+  const duRaw = takeFlagValue(rest, ['--duration']);
+  if (ivRaw !== null) {
+    const n = Number(String(ivRaw).trim());
+    if (!Number.isInteger(n) || n < 2 || n > 300) fail('--interval must be 2-300 seconds');
+    intervalSec = n;
+  }
+  if (duRaw !== null) {
+    const n = Number(String(duRaw).trim());
+    if (!Number.isInteger(n) || n < 0 || n > 3600) fail('--duration must be 0-3600 seconds (0 = until Ctrl+C)');
+    durationSec = n;
+  }
+  let baseline = sentinel.loadBaseline(dataDir);
+  if (!baseline) {
+    const snap0 = await sentinel.collectFullSnapshot();
+    baseline = sentinel.saveBaseline(dataDir, snap0);
+    ui.info('No baseline yet - created one now. Future runs will diff against it.');
+  } else {
+    ui.info(`Baseline from ${baseline.savedAt || 'unknown'} - watching for changes.`);
+  }
+  ui.info(`Listening every ${intervalSec}s${durationSec > 0 ? ` for ${durationSec}s` : ' until Ctrl+C'} (loopback-safe tables only).`);
+  sentinelOsNote();
+  const startedAt = Date.now();
+  let cycle = 0;
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  if (!replActive) {
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  }
+  if (replActive && replRl) {
+    const rl = replRl;
+    if (!rl.closed) {
+      await new Promise((resolve) => {
+        const done = () => {
+          replStopResolver = null;
+          try { rl.removeListener('close', done); } catch { /* ignore */ }
+          stop();
+          resolve();
+        };
+        replStopResolver = done;
+        try { rl.once('close', done); } catch { /* ignore */ }
+      });
+    }
+    // REPL watch loop below still runs but a pending Ctrl+C already set stopped.
+    replStopResolver = null;
+  }
+  // Main loop: quick snapshots (fast tables) diffed vs baseline.
+  while (!stopped) {
+    cycle++;
+    const snap = sentinel.collectQuickSnapshot();
+    const { alerts } = sentinel.diffSnapshot(baseline, snap);
+    if (alerts.length === 0) {
+      ui.ok(`[${cycle}] no changes vs baseline (${new Date().toISOString()})`);
+    } else {
+      for (const a of alerts) ui.warn(`[${cycle}] ${a}`);
+      try {
+        appendEvent(dataDir, makeEvent('sentinel', 'sentinel:listen', '127.0.0.1', `Listen cycle ${cycle}: ${alerts.length} change(s): ${alerts.slice(0, 3).join(' | ').slice(0, 300)}`, alerts.some((a) => /spoof|hosts file|evil twin/i.test(a)) ? 'high' : 'medium'));
+      } catch { /* best effort */ }
+    }
+    const elapsed = (Date.now() - startedAt) / 1000;
+    if (durationSec > 0 && elapsed >= durationSec) break;
+    // Sleep in small slices so Ctrl+C stops promptly.
+    const sleepMs = Math.min(intervalSec * 1000, Math.max(0, durationSec > 0 ? (durationSec * 1000 - elapsed * 1000) : intervalSec * 1000));
+    if (sleepMs <= 0) break;
+    const sliceEnd = Date.now() + sleepMs;
+    while (Date.now() < sliceEnd) {
+      if (stopped) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (stopped) break;
+  }
+  console.log(ui.dim('Listen stopped cleanly.'));
+}
+async function cmdSentinelBaseline(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sentinel-baseline');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  ui.info('Collecting full snapshot (netstat + arp + wifi + hosts + dns + loopback scan)...');
+  const snap = await sentinel.collectFullSnapshot();
+  const saved = sentinel.saveBaseline(dataDir, snap);
+  ui.ok(`Baseline saved (${saved.savedAt}). Listeners: ${(saved.listeners || []).length}, ARP: ${Object.keys(saved.arp || {}).length}, Wi-Fi nets: ${(saved.wifi || []).length}, hosts: ${saved.hostsHash ? String(saved.hostsHash).slice(0, 12) : '-'}.`);
+  sentinelOsNote();
+}
+async function cmdSentinelCheck(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sentinel-check');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  let baseline = sentinel.loadBaseline(dataDir);
+  if (!baseline) {
+    const snap0 = await sentinel.collectFullSnapshot();
+    baseline = sentinel.saveBaseline(dataDir, snap0);
+    ui.info('No baseline yet - created one now. Re-run to diff.');
+    console.log(ui.box('sentinel-check', ['baseline: created', `listeners: ${(baseline.listeners || []).length}`, `arp entries: ${Object.keys(baseline.arp || {}).length}`, 'alerts: 0 (first run)']));
+    return;
+  }
+  const snap = await sentinel.collectFullSnapshot();
+  const { alerts, details } = sentinel.diffSnapshot(baseline, snap);
+  const events = readEvents(dataDir);
+  const { score, level, factors } = sentinel.computeThreatScore(events);
+  if (alerts.length === 0) {
+    ui.ok('No changes vs baseline.');
+  } else {
+    for (const a of alerts) ui.warn(a);
+  }
+  console.log(ui.box('sentinel-check', [`alerts: ${alerts.length}`, `new listeners: ${details.newListeners.length}`, `arp new/changed: ${details.arpAdded.length}/${details.arpChanged.length}`, `wifi flags: ${(details.wifi || []).length}`, `hosts changed: ${details.hostsChanged ? 'YES' : 'no'}`, `dns changes: ${(details.dnsChanged || []).length}`, `threat score: ${score}/100 (${level})`]));
+  console.log(ui.table(['FACTOR', 'DETAIL', 'PTS'], factors.map((f) => [f.factor, f.detail, String(f.points)])));
+  try {
+    appendEvent(dataDir, makeEvent('sentinel', 'sentinel:check', '127.0.0.1', `Check: ${alerts.length} alert(s), score ${score}/100 (${level})`, alerts.length > 0 ? 'medium' : 'low'));
+  } catch { /* best effort */ }
+}
+async function cmdSentinelReport(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sentinel-report');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const events = readEvents(dataDir).filter((e) => e.type === 'sentinel');
+  console.log(ui.box('sentinel-report', [`sentinel events: ${events.length}`, `range: ${events.length > 0 ? `${events[0].time} .. ${events[events.length - 1].time}` : '-'}`]));
+  if (events.length === 0) { console.log(ui.dim('No sentinel events yet. Run "ducgo listen" or "ducgo sentinel-check".')); return; }
+  console.log(ui.table(['TIME', 'TRAP', 'DETAIL'], events.slice(-10).map((e) => [String(e.time), String(e.trap), String(e.detail).replace(/\s+/g, ' ').slice(0, 80)])));
+}
+async function cmdOpenPorts(rest) {
+  if (wantsHelp(rest)) return cmdUsage('open-ports');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  ui.info('Self-scan of 127.0.0.1 common ports (short timeout) + local listeners from netstat.');
+  const [open, ns] = await Promise.all([
+    sentinel.scanLoopbackPorts('127.0.0.1', sentinel.COMMON_PORTS, 350),
+    Promise.resolve(sentinel.getNetstatSnapshot()),
+  ]);
+  if (!ns.ok) ui.warn(`netstat unavailable: ${ns.error} (showing self-scan only)`);
+  else if ((ns.listeners || []).length > 0) {
+    console.log(ui.table(['PROTO', 'LOCAL', 'PORT', 'PID'], ns.listeners.map((l) => [l.proto, l.local, String(l.port), String(l.pid || '-')])));
+  } else console.log(ui.dim('No listeners reported by netstat.'));
+  console.log(ui.box('open-ports (127.0.0.1 self-scan)', [open.length > 0 ? `open: ${open.join(', ')}` : 'open: none of the common ports']));
+  console.log(ui.dim('Loopback only - never probes remote hosts.'));
+}
+async function cmdConnSummary(rest) {
+  if (wantsHelp(rest)) return cmdUsage('conn-summary');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const ns = sentinel.getNetstatSnapshot();
+  if (!ns.ok) fail(`netstat unavailable: ${ns.error}`);
+  const est = (ns.conns || []).filter((c) => String(c.state || '').toUpperCase() === 'ESTABLISHED');
+  if (est.length === 0) { console.log(ui.dim('No established TCP connections right now.')); return; }
+  const tl = sentinel.getTasklistMap();
+  const pmap = tl.ok ? tl.map : new Map();
+  const groups = new Map();
+  for (const c of est) {
+    const key = `${c.remoteIp}:${c.remotePort}`;
+    let g = groups.get(key);
+    if (!g) { g = { remote: key, count: 0, pids: new Set(), procs: new Set() }; groups.set(key, g); }
+    g.count++;
+    if (c.pid) { g.pids.add(c.pid); if (pmap.has(c.pid)) g.procs.add(pmap.get(c.pid)); }
+  }
+  const rows = [...groups.values()].sort((a, b) => b.count - a.count).slice(0, 30).map((g) => [g.remote, String(g.count), [...g.pids].join(',') || '-', [...g.procs].join(',') || '-']);
+  console.log(ui.table(['REMOTE IP:PORT', 'CONNS', 'PID(S)', 'PROCESS'], rows));
+  if (!tl.ok) console.log(ui.dim(`Process names unavailable (${tl.error}) - PIDs shown only.`));
+}
+async function cmdArpWatch(rest) {
+  if (wantsHelp(rest)) return cmdUsage('arp-watch');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const cur = sentinel.getArpTable();
+  if (!cur.ok) fail(`arp unavailable: ${cur.error}`);
+  const baseline = sentinel.loadBaseline(dataDir);
+  if ((cur.entries || []).length > 0) {
+    console.log(ui.table(['IP', 'MAC', 'TYPE'], cur.entries.map((e) => [e.ip, e.mac, e.type])));
+  } else console.log(ui.dim('ARP table empty.'));
+  if (!baseline || !baseline.arp) {
+    ui.info('No baseline yet - run "ducgo sentinel-baseline" to enable change detection.');
+    return;
+  }
+  const d = sentinel.diffArp(baseline.arp, cur.entries);
+  if (d.added.length === 0 && d.changed.length === 0) ui.ok('No new or changed MACs vs baseline.');
+  for (const a of d.added) ui.warn(`New device (first seen): ${a.ip} -> ${a.mac}`);
+  for (const c of d.changed) ui.warn(`Possible spoofing: ${c.ip} changed ${c.oldMac} -> ${c.newMac} - verify the device`);
+  if (d.changed.length > 0) console.log(ui.dim('False positives: DHCP reassignments, new phones, VPNs. Confirm unknown MACs with your router admin page.'));
+}
+async function cmdWifiScan(rest) {
+  if (wantsHelp(rest)) return cmdUsage('wifi-scan');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const cur = sentinel.getWifiNetworks();
+  if (!cur.ok) { ui.warn(`Wi-Fi scan unavailable: ${cur.error}`); console.log(ui.dim('Needs Windows + WLAN adapter. Parsers still tested with fixtures.')); return; }
+  if ((cur.networks || []).length === 0) { console.log(ui.dim('No wireless networks reported.')); return; }
+  const rows = [];
+  for (const n of cur.networks) {
+    for (const b of n.bssids || []) rows.push([n.ssid, b.bssid, b.signal || '-', n.auth || '-', n.encryption || '-']);
+    if ((n.bssids || []).length === 0) rows.push([n.ssid, '-', '-', n.auth || '-', n.encryption || '-']);
+  }
+  console.log(ui.table(['SSID', 'BSSID', 'SIGNAL', 'AUTH', 'ENCRYPTION'], rows));
+  const baseline = sentinel.loadBaseline(dataDir);
+  if (!baseline || !Array.isArray(baseline.wifi)) {
+    ui.info('No baseline yet - run "ducgo sentinel-baseline" to enable evil-twin detection.');
+    return;
+  }
+  const alerts = sentinel.detectEvilTwin(baseline.wifi, cur.networks);
+  if (alerts.length === 0) ui.ok('No evil-twin signs vs baseline.');
+  for (const a of alerts) ui.warn(a.detail);
+  if (alerts.length > 0) console.log(ui.dim('Heuristics only - duplicate SSIDs can be legit mesh/repeaters. Confirm BSSIDs with your router. No packet capture is used.'));
+}
+async function cmdHostsVerify(rest) {
+  if (wantsHelp(rest)) return cmdUsage('hosts-verify');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const cur = sentinel.readHostsHash();
+  if (!cur.ok) fail(`Cannot read hosts file (${cur.path}): ${cur.error}`);
+  const baseline = sentinel.loadBaseline(dataDir);
+  console.log(ui.box('hosts-verify', [`path: ${cur.path}`, `sha256: ${cur.hash}`, `size: ${cur.size} bytes`]));
+  if (!baseline || !baseline.hostsHash) {
+    ui.info('No stored hosts hash - saving current as baseline. Re-run to verify.');
+    const snap = await sentinel.collectFullSnapshot();
+    sentinel.saveBaseline(dataDir, snap);
+    return;
+  }
+  if (baseline.hostsHash === cur.hash) ui.ok('Hosts file matches baseline.');
+  else {
+    ui.warn(`Hosts file CHANGED vs baseline (${String(baseline.hostsHash).slice(0, 12)}.. -> ${String(cur.hash).slice(0, 12)}..). Review for hijack entries.`);
+    process.exit(1);
+  }
+}
+async function cmdDnsCheck(rest) {
+  if (wantsHelp(rest)) return cmdUsage('dns-check');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  ui.info(`Resolving: ${sentinel.DNS_HOSTS.join(', ')} (stdlib lookup only, no DoH).`);
+  const cur = await sentinel.resolveDnsList();
+  console.log(ui.table(['HOST', 'IPS'], Object.entries(cur).map(([h, ips]) => [h, (ips || []).join(', ') || '(unresolved)'])));
+  const baseline = sentinel.loadBaseline(dataDir);
+  if (!baseline || !baseline.dns) {
+    ui.info('No stored DNS baseline - saving current as baseline. Re-run to diff.');
+    const snap = await sentinel.collectFullSnapshot();
+    sentinel.saveBaseline(dataDir, snap);
+    return;
+  }
+  const changes = sentinel.diffDns(baseline.dns, cur);
+  if (changes.length === 0) ui.ok('No DNS changes vs baseline.');
+  for (const c of changes) ui.warn(`DNS change: ${c.host} [${(c.oldIps || []).join(', ') || '-'}] -> [${(c.newIps || []).join(', ') || '-'}] (could be legit CDN rotation - re-check)`);
+}
+async function cmdThreatScore(rest) {
+  if (wantsHelp(rest)) return cmdUsage('threat-score');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const events = readEvents(dataDir);
+  const { score, level, factors, counts } = sentinel.computeThreatScore(events);
+  const color = level === 'high' ? ui.paint('red', `${score}/100 (${level})`) : level === 'low' ? ui.paint('green', `${score}/100 (${level})`) : ui.paint('yellow', `${score}/100 (${level})`);
+  console.log(ui.box('threat-score', [`score: ${score}/100`, `level: ${level}`, `events: ${counts.total} total, ${counts.last24} in 24h`]));
+  console.log(`Score: ${color}`);
+  console.log(ui.table(['FACTOR', 'DETAIL', 'PTS'], factors.map((f) => [f.factor, f.detail, String(f.points)])));
+  console.log(ui.dim('Heuristic 0-100 from local trap + sentinel events only. Not a verdict - use with sentinel-report.'));
+}
+// ================= INTEGRITY (file tripwires, sha256) =================
+async function cmdIntegrityAdd(rest) {
+  if (wantsHelp(rest)) return cmdUsage('integrity-add');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const files = positionals(rest);
+  if (files.length === 0) fail('Usage: ducgo integrity-add <file...>');
+  let okN = 0;
+  for (const f of files) {
+    const r = sentinel.integrityAdd(dataDir, f);
+    if (!r.ok) ui.err(r.error);
+    else { ui.ok(`${r.updated ? 'Updated' : 'Watching'}: ${r.path} [${String(r.hash).slice(0, 16)}..]`); okN++; }
+  }
+  if (okN === 0) fail('No files added.');
+}
+async function cmdIntegrityList(rest) {
+  if (wantsHelp(rest)) return cmdUsage('integrity-list');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const st = sentinel.loadIntegrity(dataDir);
+  const keys = Object.keys(st.files || {});
+  if (keys.length === 0) { ui.dim('No integrity files. Use "ducgo integrity-add <file>".'); return; }
+  console.log(ui.table(['FILE', 'SHA256 (12)', 'SIZE'], keys.sort().map((k) => [k, String(st.files[k].sha256 || '').slice(0, 12), String(st.files[k].size ?? '-')])));
+}
+async function cmdIntegrityVerify(rest) {
+  if (wantsHelp(rest)) return cmdUsage('integrity-verify');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const st = sentinel.loadIntegrity(dataDir);
+  if (Object.keys(st.files || {}).length === 0) { ui.dim('No integrity files. Use "ducgo integrity-add <file>".'); return; }
+  const r = sentinel.integrityVerify(dataDir);
+  if (r.okFiles.length > 0) console.log(ui.table(['OK', 'FILE'], r.okFiles.map((f) => ['OK', f.path])));
+  for (const c of r.changed) ui.warn(`CHANGED: ${c.path} (${String(c.oldHash).slice(0, 12)}.. -> ${String(c.newHash).slice(0, 12)}..)`);
+  for (const m of r.missing) ui.warn(`MISSING: ${m.path}`);
+  console.log(ui.box('integrity-verify', [`total: ${r.total}`, `ok: ${r.okFiles.length}`, `changed: ${r.changed.length}`, `missing: ${r.missing.length}`]));
+  if (r.changed.length > 0 || r.missing.length > 0) process.exit(1);
+  else ui.ok('All watched files match baseline.');
+}
+async function cmdIntegrityRemove(rest) {
+  if (wantsHelp(rest)) return cmdUsage('integrity-remove');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const f = firstPositional(rest);
+  if (!f) fail('Usage: ducgo integrity-remove <file>');
+  const r = sentinel.integrityRemove(dataDir, f);
+  if (!r.ok) fail(r.error);
+  ui.ok(`Stopped watching: ${r.path}`);
+}
+async function cmdIntegrityBaselineRefresh(rest) {
+  if (wantsHelp(rest)) return cmdUsage('integrity-baseline-refresh');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const r = sentinel.integrityRefresh(dataDir);
+  if (r.total === 0) { ui.dim('No integrity files. Use "ducgo integrity-add <file>".'); return; }
+  ui.ok(`Baseline refreshed: ${r.refreshed}/${r.total} file(s).${r.gone.length > 0 ? ` Missing: ${r.gone.join(', ')}` : ''}`);
+}
+
+// Command dispatch table (exactly 86 entries). Shared by one-shot mode and
 // the interactive REPL so both modes run the SAME handler path.
 // NOTE: extras (plugin mgmt, completion, alias, macro, __complete) plus
-// plugin/alias/macro expansions live OUTSIDE this table so the 70 contract
-// (`commands --count` -> 70) never breaks. See EXTRA_HANDLERS + dispatchTokens.
+// plugin/alias/macro expansions live OUTSIDE this table so the 86 contract
+// (`commands --count` -> 86) never breaks. See EXTRA_HANDLERS + dispatchTokens.
 const HANDLERS = {
   setup: cmdSetup, 'login-test': cmdLoginTest, 'change-pin': cmdChangePin, 'change-duress': cmdChangeDuress,
   'lock-status': cmdLockStatus, 'auth-status': cmdAuthStatus, 'reset-all': cmdResetAll,
@@ -2087,14 +2429,20 @@ const HANDLERS = {
   selftest: cmdSelftest, demo: cmdDemo, about: cmdAbout, backup: cmdBackup, restore: cmdRestore, wipe: cmdWipe,
   'log-path': cmdLogPath, sysinfo: cmdSysinfo, uptime: cmdUptime, tips: cmdTips, license: cmdLicense,
   'verify-install': cmdVerifyInstall, paths: cmdPaths, stats: cmdStats, support: cmdSupport,
+  listen: cmdListen, 'sentinel-baseline': cmdSentinelBaseline, 'sentinel-check': cmdSentinelCheck,
+  'sentinel-report': cmdSentinelReport, 'open-ports': cmdOpenPorts, 'conn-summary': cmdConnSummary,
+  'arp-watch': cmdArpWatch, 'wifi-scan': cmdWifiScan, 'hosts-verify': cmdHostsVerify,
+  'dns-check': cmdDnsCheck, 'threat-score': cmdThreatScore,
+  'integrity-add': cmdIntegrityAdd, 'integrity-list': cmdIntegrityList, 'integrity-verify': cmdIntegrityVerify,
+  'integrity-remove': cmdIntegrityRemove, 'integrity-baseline-refresh': cmdIntegrityBaselineRefresh,
 };
-// Extra dispatch table (NEVER counted in the 70). 9 visible extras + 1 hidden.
+// Extra dispatch table (NEVER counted in the 86). 9 visible extras + 1 hidden.
 const EXTRA_HANDLERS = {
   'plugin-add': cmdPluginAdd, 'plugin-enable': cmdPluginEnable, 'plugin-disable': cmdPluginDisable,
   'plugin-list': cmdPluginList, 'plugin-show': cmdPluginShow, 'plugin-remove': cmdPluginRemove,
   completion: cmdCompletion, alias: cmdAlias, macro: cmdMacro, '__complete': cmdCompleteHidden,
 };
-// Unified dispatch: built-ins (70) -> extras -> enabled plugin commands ->
+// Unified dispatch: built-ins (86) -> extras -> enabled plugin commands ->
 // aliases (with depth-10/cycle guard) -> macros (direct name runs macro).
 // Throws/calls process.exit(1) on unknown (one-shot) or per-line error (REPL).
 async function dispatchTokens(cmd, rest) {
@@ -2154,7 +2502,7 @@ async function dispatchTokens(cmd, rest) {
 // Bare `ducgo` (no arguments) enters a persistent REPL instead of printing
 // help-and-exit. Every line is parsed quote-aware and dispatched through the
 // SAME handlers as one-shot mode, so behavior (incl. auth/duress) is identical.
-// The registry stays exactly 70 built-ins; extras (plugins/aliases/macros +
+// The registry stays exactly 86 built-ins; extras (plugins/aliases/macros +
 // plugin-mgmt/completion) ride dispatchTokens + footer and are never counted.
 export function splitReplLine(line) {
   const out = [];
@@ -2226,7 +2574,7 @@ function appendReplHistory(historyFile, line) {
   } catch { /* history is best-effort; never break the shell */ }
 }
 // One REPL line, dispatched through the SAME handlers as one-shot mode.
-// Covers built-ins (70) + extras + enabled plugin commands + aliases/macros.
+// Covers built-ins (86) + extras + enabled plugin commands + aliases/macros.
 // `help <name>` shows origin/expansion for plugin/alias/macro. Returns 'quit'
 // when the shell should close, 'more' otherwise.
 async function replHandleLine(rawLine, ctx) {

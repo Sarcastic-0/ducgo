@@ -1,6 +1,6 @@
-// ducgo v2 - styled SOC UI kit. Node.js stdlib only.
+// ducgo v3 - styled SOC UI kit. Node.js stdlib only.
 // Minimal ANSI colors with NO_COLOR support. Used by EVERY command.
-export const VERSION = '2.0.0';
+export const VERSION = '3.0.4';
 export const TAGLINE = 'No one can race me';
 
 export const USE_COLOR = !('NO_COLOR' in process.env);

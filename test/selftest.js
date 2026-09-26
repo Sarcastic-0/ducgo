@@ -1,4 +1,4 @@
-// ducgo v2.0.0 selftest - stdlib only.
+// ducgo v3.0.4 selftest - stdlib only.
 // Run: node test/selftest.js  (also: "npm test", "ducgo selftest").
 // Prints PASS lines; exits non-zero on any failure. 23+ checks.
 import * as fs from 'node:fs';
@@ -165,14 +165,18 @@ async function testCanary() {
   }
 }
 
-// (4) ducgo v2: command count + UI + smoke
+// (4) ducgo v3: command count + UI + smoke
 function testCount() {
-  assert(COMMANDS.length === 70, `commands: count==70 (got ${COMMANDS.length})`);
+  assert(COMMANDS.length === 86, `commands: count==86 (got ${COMMANDS.length})`);
   const names = COMMANDS.map((c) => c.name);
-  assert(new Set(names).size === 70, 'commands: all names unique');
-  for (const g of ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system']) {
+  assert(new Set(names).size === 86, 'commands: all names unique');
+  for (const g of ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system', 'sentinel', 'integrity']) {
     assert(COMMANDS.some((c) => c.group === g), `commands: group present (${g})`);
   }
+  const sentN = COMMANDS.filter((c) => c.group === 'sentinel').length;
+  const intN = COMMANDS.filter((c) => c.group === 'integrity').length;
+  assert(sentN === 11, `commands: sentinel group has 11 (got ${sentN})`);
+  assert(intN === 5, `commands: integrity group has 5 (got ${intN})`);
 }
 
 function testBanner() {
@@ -203,7 +207,7 @@ function cliPath() {
 
 function testCommandsCountCli() {
   const r = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8' });
-  assert(r.status === 0 && String(r.stdout || '').trim() === '70', 'cli: commands --count prints exactly 70');
+  assert(r.status === 0 && String(r.stdout || '').trim() === '86', 'cli: commands --count prints exactly 86');
 }
 
 function testReplQuoteParsing() {
@@ -243,8 +247,8 @@ function testReplPiped() {
     const out = String(r.stdout || '') + String(r.stderr || '');
     assert(r.status === 0, 'repl: piped session exits 0', `status=${r.status} out=${out.slice(0, 500)}`);
     assert(out.includes(TAGLINE) || out.includes('██'), 'repl: piped session prints the banner once');
-    assert(out.includes(`ducgo v${VERSION}`), 'repl: piped session prints ducgo v2.0.0');
-    assert(out.split(/\r?\n/).some((l) => l.trim() === '70'), 'repl: commands --count prints 70 inside REPL');
+    assert(out.includes(`ducgo v${VERSION}`), 'repl: piped session prints ducgo v3.0.4');
+    assert(out.split(/\r?\n/).some((l) => l.trim() === '86'), 'repl: commands --count prints 86 inside REPL');
     assert(out.toLowerCase().includes('unknown command'), 'repl: unknown command reported, shell survives it');
     assert(out.includes('ducgo> '), 'repl: prompt loop shown (ducgo> )');
     assert(fs.existsSync(path.join(dir, 'history')), 'repl: history persisted at <dataDir>/history');
@@ -296,7 +300,7 @@ function testOneShotStillFine() {
     const v = spawnSync(process.execPath, [cliPath(), 'version'], { encoding: 'utf8', timeout: 15000, env });
     assert(v.status === 0 && String(v.stdout || '').includes(`ducgo v${VERSION}`), 'cli: one-shot version unchanged');
     const c = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8', timeout: 15000, env });
-    assert(c.status === 0 && String(c.stdout || '').trim() === '70', 'cli: one-shot commands --count still 70');
+    assert(c.status === 0 && String(c.stdout || '').trim() === '86', 'cli: one-shot commands --count still 86');
     const u = spawnSync(process.execPath, [cliPath(), 'boguscmd'], { encoding: 'utf8', timeout: 15000, env });
     assert(u.status === 1 && (String(u.stdout || '') + String(u.stderr || '')).toLowerCase().includes('unknown command'), 'cli: one-shot unknown still exits 1');
   } finally {
@@ -508,12 +512,12 @@ function testCountWithExtras() {
     runCli(dir, ['plugin-enable', 'hello-plugin'], PIN + '\n');
     runCli(dir, ['alias', 'set', 'll', 'version'], PIN + '\n');
     runCli(dir, ['macro', 'set', 'daily', 'version; banner'], PIN + '\n');
-    assert(COMMANDS.length === 70, 'contract: built-ins exactly 70');
+    assert(COMMANDS.length === 86, 'contract: built-ins exactly 86');
     const c = runCli(dir, ['commands', '--count']);
-    assert(c.status === 0 && String(c.stdout || '').trim() === '70', 'contract: commands --count stays 70 with extras');
+    assert(c.status === 0 && String(c.stdout || '').trim() === '86', 'contract: commands --count stays 86 with extras');
     const full = runCli(dir, ['commands']);
     const fullOut = String(full.stdout || '') + String(full.stderr || '');
-    assert(full.status === 0 && fullOut.includes('Total: 70'), 'contract: grouped list still 70');
+    assert(full.status === 0 && fullOut.includes('Total: 86'), 'contract: grouped list still 86');
     assert(/\+ \d+ plugin command\(s\)/i.test(fullOut), 'contract: footer line for extras');
     assert(/\+ [1-9]\d* plugin command\(s\)/i.test(fullOut), 'contract: footer shows enabled plugin count');
   } finally {
@@ -585,10 +589,240 @@ function testExtrasSmoke() {
   }
 }
 
+// ---------- sentinel + integrity (v3, scratch MIRAGENET_DIR only) ----------
+const NETSTAT_FIXTURE = [
+  'Active Connections',
+  '',
+  '  Proto  Local Address          Foreign Address        State           PID',
+  '  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1111',
+  '  TCP    127.0.0.1:18080        0.0.0.0:0              LISTENING       2222',
+  '  TCP    192.168.1.5:54321      93.184.216.34:443      ESTABLISHED     3333',
+  '  UDP    0.0.0.0:5353           *:*                                    4444',
+].join('\r\n');
+
+const ARP_FIXTURE_A = [
+  'Interface: 192.168.1.5 --- 0x4',
+  '  Internet Address      Physical Address      Type',
+  '  192.168.1.1           aa-bb-cc-dd-ee-ff     dynamic',
+  '  192.168.1.10          11-22-33-44-55-66     dynamic',
+].join('\r\n');
+
+const ARP_FIXTURE_B = [
+  'Interface: 192.168.1.5 --- 0x4',
+  '  Internet Address      Physical Address      Type',
+  '  192.168.1.1           aa-bb-cc-dd-ee-00     dynamic',
+  '  192.168.1.10          11-22-33-44-55-66     dynamic',
+  '  192.168.1.99          77-88-99-aa-bb-cc     dynamic',
+].join('\r\n');
+
+const NETSH_BASE_FIXTURE = [
+  'SSID 1 : HomeNet',
+  '    Network type            : Infrastructure',
+  '    Authentication          : WPA2-Personal',
+  '    Encryption              : CCMP',
+  '    BSSID 1                 : aa:bb:cc:dd:ee:ff',
+  '         Signal             : 90%',
+  '         Radio type         : 802.11n',
+  '         Channel            : 6',
+].join('\n');
+
+const NETSH_EVIL_FIXTURE = [
+  'SSID 1 : HomeNet',
+  '    Network type            : Infrastructure',
+  '    Authentication          : WPA2-Personal',
+  '    Encryption              : CCMP',
+  '    BSSID 1                 : aa:bb:cc:dd:ee:ff',
+  '         Signal             : 90%',
+  '         Radio type         : 802.11n',
+  '         Channel            : 6',
+  '    BSSID 2                 : 11:22:33:44:55:66',
+  '         Signal             : 85%',
+  '         Radio type         : 802.11n',
+  '         Channel            : 6',
+  'SSID 2 : HomeNet',
+  '    Network type            : Infrastructure',
+  '    Authentication          : Open',
+  '    Encryption              : None',
+  '    BSSID 1                 : de:ad:be:ef:00:01',
+  '         Signal             : 99%',
+  '         Radio type         : 802.11n',
+  '         Channel            : 6',
+].join('\n');
+
+async function testSentinelParsers() {
+  const s = await import('../src/sentinel.js');
+  const p = s.parseNetstat(NETSTAT_FIXTURE);
+  assert(p.listeners.length === 3, `sentinel: netstat fixture finds 3 listeners (got ${p.listeners.length})`);
+  assert(p.listeners.some((l) => l.port === 135), 'sentinel: listener :135 parsed');
+  assert(p.listeners.filter((l) => l.proto === 'TCP').length === 2, 'sentinel: 2 TCP listeners in fixture');
+  assert(p.conns.length === 1 && p.conns[0].remoteIp === '93.184.216.34', 'sentinel: established conn parsed with remote IP');
+  const arpA = s.parseArp(ARP_FIXTURE_A);
+  assert(arpA.length === 2, `sentinel: arp fixture A has 2 entries (got ${arpA.length})`);
+  const arpB = s.parseArp(ARP_FIXTURE_B);
+  const baseMap = {};
+  for (const e of arpA) baseMap[e.ip] = e.mac;
+  const d = s.diffArp(baseMap, arpB);
+  assert(d.changed.length === 1 && d.changed[0].ip === '192.168.1.1', 'sentinel: arp MAC change detected (possible spoofing)');
+  assert(d.added.length === 1 && d.added[0].ip === '192.168.1.99', 'sentinel: arp new device detected');
+  const wifiBase = s.parseNetshWlan(NETSH_BASE_FIXTURE);
+  assert(wifiBase.length === 1 && wifiBase[0].ssid === 'HomeNet', 'sentinel: netsh baseline SSID parsed');
+  const wifiCur = s.parseNetshWlan(NETSH_EVIL_FIXTURE);
+  const twins = s.detectEvilTwin(wifiBase, wifiCur);
+  assert(twins.some((t) => t.kind === 'open-twin'), 'sentinel: open twin of known network flagged');
+  assert(twins.some((t) => t.kind === 'new-bssid' || t.kind === 'multi-bssid' || t.kind === 'bssid-change'), 'sentinel: evil-twin new-BSSID flagged');
+  const h1 = s.sha256String('hello');
+  assert(h1 === '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824', 'sentinel: sha256 known-vector ok');
+  const tl = s.parseTasklist('"chrome.exe","1234","Console","1","200,000 K"\r\n"svchost.exe","567","Services","0","10,000 K"');
+  assert(tl.get(1234) === 'chrome.exe', 'sentinel: tasklist PID map ok');
+}
+
+async function testSentinelBaselineRoundTrip() {
+  const s = await import('../src/sentinel.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-sentbase-'));
+  try {
+    const snap = {
+      at: new Date().toISOString(),
+      listeners: [{ proto: 'TCP', local: '0.0.0.0:135', port: 135, pid: 1 }],
+      arp: { '192.168.1.1': 'aa-bb-cc-dd-ee-ff' },
+      arpEntries: [{ ip: '192.168.1.1', mac: 'aa-bb-cc-dd-ee-ff', type: 'dynamic', iface: '' }],
+      wifi: s.parseNetshWlan(NETSH_BASE_FIXTURE),
+      hostsHash: s.sha256String('baseline-hosts'),
+      dns: { 'example.com': ['1.2.3.4'] },
+      openPorts: [135],
+    };
+    s.saveBaseline(dir, snap);
+    const loaded = s.loadBaseline(dir);
+    assert(!!loaded && loaded.hostsHash === snap.hostsHash, 'sentinel: baseline save/load round-trip');
+    const same = s.diffSnapshot(loaded, { ...snap, arpEntries: snap.arpEntries });
+    assert(same.alerts.length === 0, 'sentinel: identical snapshot diffs to 0 alerts');
+    const mutated = {
+      ...snap,
+      listeners: [...snap.listeners, { proto: 'TCP', local: '0.0.0.0:9999', port: 9999, pid: 9 }],
+      arpEntries: [{ ip: '192.168.1.1', mac: 'aa-bb-cc-dd-ee-00', type: 'dynamic', iface: '' }],
+      arp: { '192.168.1.1': 'aa-bb-cc-dd-ee-00' },
+    };
+    const d2 = s.diffSnapshot(loaded, mutated);
+    assert(d2.alerts.length >= 2, `sentinel: mutated snapshot raises alerts (got ${d2.alerts.length})`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testThreatScoreBounds() {
+  const s = await import('../src/sentinel.js');
+  const empty = s.computeThreatScore([]);
+  assert(empty.score === 0 && empty.level === 'low', 'sentinel: empty log scores 0/low');
+  assert(Array.isArray(empty.factors) && empty.factors.length >= 5, 'sentinel: factor table transparent');
+  const now = new Date().toISOString();
+  const heavy = [];
+  for (let i = 0; i < 10; i++) heavy.push({ id: `x${i}`, time: now, type: 'honey-tcp', trap: 'honey-tcp:2222', ip: '1.2.3.4', detail: 'probe', severity: 'critical' });
+  heavy.push({ id: 'd1', time: now, type: 'duress', trap: 'duress-pin', ip: '127.0.0.1', detail: 'duress', severity: 'critical' });
+  const hs = s.computeThreatScore(heavy);
+  assert(hs.score >= 0 && hs.score <= 100, `sentinel: score bounded 0-100 (got ${hs.score})`);
+  assert(hs.score > empty.score, 'sentinel: heavy log scores higher than empty');
+  const mid = s.computeThreatScore([{ id: 'a', time: now, type: 'sim', trap: 'x', ip: '1.1.1.1', detail: 'demo', severity: 'low' }]);
+  assert(mid.score >= 0 && mid.score <= 100, 'sentinel: single low event bounded');
+}
+
+function testIntegrityCycle() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-int-'));
+  try {
+    const PIN = 'alpha-9912';
+    setupScratch(dir);
+    const f = path.join(dir, 'watched.txt');
+    fs.writeFileSync(f, 'original-content', 'utf8');
+    const add = runCli(dir, ['integrity-add', f], PIN + '\n');
+    assert(add.status === 0, 'integrity: add exits 0');
+    const ver1 = runCli(dir, ['integrity-verify'], PIN + '\n');
+    assert(ver1.status === 0, 'integrity: verify clean exits 0');
+    fs.appendFileSync(f, '-tampered');
+    const ver2 = runCli(dir, ['integrity-verify'], PIN + '\n');
+    const ver2Out = String(ver2.stdout || '') + String(ver2.stderr || '');
+    assert(ver2.status === 1 && /CHANGED/i.test(ver2Out), 'integrity: tamper detected (CHANGED, exit 1)');
+    const ref = runCli(dir, ['integrity-baseline-refresh'], PIN + '\n');
+    assert(ref.status === 0, 'integrity: baseline-refresh exits 0');
+    const ver3 = runCli(dir, ['integrity-verify'], PIN + '\n');
+    assert(ver3.status === 0, 'integrity: verify clean again after refresh');
+    const list = runCli(dir, ['integrity-list'], PIN + '\n');
+    assert(list.status === 0 && String(list.stdout || '').includes('watched.txt'), 'integrity: list shows file');
+    const rem = runCli(dir, ['integrity-remove', f], PIN + '\n');
+    assert(rem.status === 0, 'integrity: remove exits 0');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testVersionExact() {
+  assert(VERSION === '3.0.4', `version: ui VERSION exactly 3.0.4 (got ${VERSION})`);
+  const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert(pkg.version === '3.0.4', 'version: package.json exactly 3.0.4');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-ver-'));
+  try {
+    const v = runCli(dir, ['version']);
+    assert(v.status === 0 && String(v.stdout || '').includes('ducgo v3.0.4'), 'version: output exactly ducgo v3.0.4');
+    const b = spawnSync(process.execPath, [cliPath(), 'banner'], { encoding: 'utf8', timeout: 15000, env: { ...process.env, MIRAGENET_DIR: dir } });
+    assert(b.status === 0 && String(b.stdout || '').includes('ducgo v3.0.4'), 'version: banner line exactly ducgo v3.0.4');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+async function testSentinelLive() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-sentlive-'));
+  try {
+    const PIN = 'alpha-9912';
+    const DURESS = 'duress-4417';
+    setupScratch(dir, PIN, DURESS);
+    const base = runCli(dir, ['sentinel-baseline'], PIN + '\n');
+    assert(base.status === 0, 'sentinel-live: baseline exits 0');
+    const check = runCli(dir, ['sentinel-check'], PIN + '\n');
+    const checkOut = String(check.stdout || '') + String(check.stderr || '');
+    assert(check.status === 0 && /threat score/i.test(checkOut), 'sentinel-live: check shows score');
+    const score = runCli(dir, ['threat-score'], PIN + '\n');
+    const scoreOut = String(score.stdout || '') + String(score.stderr || '');
+    assert(score.status === 0 && /FACTOR/i.test(scoreOut), 'sentinel-live: threat-score factor table shown');
+    const rep = runCli(dir, ['sentinel-report'], PIN + '\n');
+    assert(rep.status === 0, 'sentinel-live: report exits 0');
+    const arp = runCli(dir, ['arp-watch'], PIN + '\n');
+    assert(arp.status === 0, 'sentinel-live: arp-watch exits 0');
+    const hosts = runCli(dir, ['hosts-verify'], PIN + '\n');
+    assert(hosts.status === 0, 'sentinel-live: hosts-verify exits 0');
+    const open = runCli(dir, ['open-ports'], PIN + '\n');
+    assert(open.status === 0, 'sentinel-live: open-ports exits 0');
+    const conn = runCli(dir, ['conn-summary'], PIN + '\n');
+    assert(conn.status === 0, 'sentinel-live: conn-summary exits 0');
+    // REAL listen --duration 3 on loopback-safe queries, clean stop exit 0.
+    const t0 = Date.now();
+    const listen = spawnSync(process.execPath, [cliPath(), 'listen', '--interval', '2', '--duration', '3'], {
+      input: PIN + '\n', encoding: 'utf8', timeout: 30000, env: { ...process.env, MIRAGENET_DIR: dir },
+    });
+    const dt = Date.now() - t0;
+    const listenOut = String(listen.stdout || '') + String(listen.stderr || '');
+    assert(listen.status === 0, `sentinel-live: listen --duration 3 stops cleanly exit 0 (got ${listen.status})`);
+    assert(/stopped cleanly/i.test(listenOut), 'sentinel-live: listen prints clean stop');
+    assert(dt < 25000, 'sentinel-live: listen duration bounded');
+    // Duress sees all-clear only on a sensitive sentinel command.
+    const du = runCli(dir, ['threat-score'], DURESS + '\n');
+    const duOut = String(du.stdout || '') + String(du.stderr || '');
+    assert(du.status === 0 && duOut.includes('All clear - no threats detected.'), 'sentinel-live: duress all-clear on sentinel');
+    // REPL parity spot check: new names resolve inside the shell.
+    const input = ['commands --count', 'help listen', 'quit'].join('\n') + '\n';
+    const repl = spawnSync(process.execPath, [cliPath()], {
+      input, encoding: 'utf8', timeout: 30000, env: { ...process.env, MIRAGENET_DIR: dir },
+    });
+    const replOut = String(repl.stdout || '') + String(repl.stderr || '');
+    assert(repl.status === 0, 'sentinel-live: REPL spot check exits 0');
+    assert(replOut.split(/\r?\n/).some((l) => l.trim() === '86'), 'sentinel-live: REPL count==86');
+    assert(replOut.includes('ducgo listen'), 'sentinel-live: REPL help listen works');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export async function runSelfTest() {
   failures = 0;
   passes = 0;
-  console.log('ducgo selftest - auth, traps, canary, count, ui, smoke, plugins, completion, alias, macro');
+  console.log('ducgo selftest - auth, traps, canary, count, ui, smoke, plugins, completion, alias, macro, sentinel, integrity');
   await testAuth();
   await testTraps();
   await testCanary();
@@ -609,6 +843,12 @@ export async function runSelfTest() {
   testDuressPlugins();
   testReplPlugins();
   testExtrasSmoke();
+  await testSentinelParsers();
+  await testSentinelBaselineRoundTrip();
+  await testThreatScoreBounds();
+  testIntegrityCycle();
+  await testVersionExact();
+  await testSentinelLive();
   console.log(`\n${passes} check(s) passed.`);
   if (failures === 0) {
     console.log('SELFTEST PASS - all checks passed');

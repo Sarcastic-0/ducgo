@@ -1,7 +1,7 @@
 {
   "name": "ducgo",
-  "version": "2.0.0",
-  "description": "ducgo - passive deception tripwires (CLI only, English only, zero runtime dependencies)",
+  "version": "3.0.4",
+  "description": "ducgo - passive deception tripwires + network sentinel (CLI only, English only, zero runtime dependencies)",
   "type": "module",
   "bin": {
     "ducgo": "./src/cli.js"
