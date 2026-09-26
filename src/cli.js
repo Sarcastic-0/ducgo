@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as net from 'node:net';
+import * as readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { isSetup, setupPins, verifyPin, loadAuth, changeAccessPin, changeDuressPin } from './auth.js';
 import {
@@ -178,6 +179,22 @@ function fail(msg) {
 // ---------- hidden PIN prompt (stdin raw mode, no echo) ----------
 let pipedLines = null;
 let pipedIdx = 0;
+// REPL state (only active inside runRepl; one-shot mode never touches these).
+let replActive = false;
+let replRl = null;
+let replSawDuress = false;
+let replStopResolver = null;
+let replCancelPrompt = null;
+// Piped REPL input: stdin is drained once upfront so command lines and PIN/
+// confirm sub-prompts share one deterministic line stream (readline closes at
+// EOF on pipes, so sub-prompts cannot read from it afterwards).
+let replPipeLines = null;
+let replPipeIdx = 0;
+let replPipedMode = false;
+let replAbort = false;
+class ReplExit {
+  constructor(code) { this.code = code ?? 0; }
+}
 function readPipedLine(query) {
   process.stdout.write(query);
   if (pipedLines === null) {
@@ -192,6 +209,7 @@ function readPipedLine(query) {
   return Promise.resolve(line.replace(/\r$/, ''));
 }
 function promptHidden(query) {
+  if (replActive && replRl) return replPromptHidden(query);
   if (!process.stdin.isTTY) return readPipedLine(query);
   return new Promise((resolve) => {
     process.stdout.write(query);
@@ -226,6 +244,7 @@ function promptHidden(query) {
   });
 }
 function promptLine(query) {
+  if (replActive && replRl) return replPromptLine(query);
   if (!process.stdin.isTTY) return readPipedLine(query);
   return new Promise((resolve) => {
     process.stdout.write(query);
@@ -245,12 +264,81 @@ function promptLine(query) {
   });
 }
 
+// ---------- REPL sub-prompts (share the readline with the prompt loop) ----------
+// Auth-gated commands call promptHidden/promptLine; inside the REPL those route
+// here so PIN entry works without fighting the main readline for stdin.
+// Answers to secret prompts are scrubbed from in-memory history (never written
+// to the history file - only REPL command lines are persisted).
+function replPipedNext(query, mask) {
+  try { process.stdout.write(query); } catch { /* ignore */ }
+  const line = (replPipeLines && replPipeIdx < replPipeLines.length) ? replPipeLines[replPipeIdx++] : '';
+  if (mask) {
+    try { process.stdout.write('******\n'); } catch { /* ignore */ }
+  }
+  return Promise.resolve(line.replace(/\r$/, ''));
+}
+function replPromptLine(query) {
+  if (replPipeLines) return replPipedNext(query, false);
+  const rl = replRl;
+  return new Promise((resolve) => {
+    const done = (ans) => {
+      if (replCancelPrompt === cancel) replCancelPrompt = null;
+      try { rl.removeListener('close', onClose); } catch { /* ignore */ }
+      resolve(ans);
+    };
+    const cancel = (v) => done(v ?? '');
+    const onClose = () => done('');
+    replCancelPrompt = cancel;
+    try { rl.once('close', onClose); } catch { /* ignore */ }
+    try {
+      rl.question(query, (ans) => done(ans));
+    } catch {
+      done('');
+    }
+  });
+}
+function replPromptHidden(query) {
+  if (replPipeLines) return replPipedNext(query, true);
+  const rl = replRl;
+  // Piped REPL input: no TTY to hide from, just read the next line.
+  if (!process.stdin.isTTY) return replPromptLine(query);
+  return new Promise((resolve) => {
+    const origWrite = rl._writeToOutput;
+    const done = (ans) => {
+      if (replCancelPrompt === cancel) replCancelPrompt = null;
+      try { rl._writeToOutput = origWrite; } catch { /* ignore */ }
+      try { rl.removeListener('close', onClose); } catch { /* ignore */ }
+      // Scrub the secret from in-memory history (up/down recall must not leak it).
+      try {
+        const i = rl.history.indexOf(ans);
+        if (i !== -1) rl.history.splice(i, 1);
+      } catch { /* ignore */ }
+      resolve(ans);
+    };
+    const cancel = (v) => { try { rl.output.write('\n'); } catch { /* ignore */ } done(v ?? ''); };
+    const onClose = () => done('');
+    replCancelPrompt = cancel;
+    rl._writeToOutput = function () {
+      try {
+        rl.output.write('\x1B[2K\x1B[200D' + query + '*'.repeat(rl.line.length));
+      } catch { /* ignore */ }
+    };
+    try { rl.once('close', onClose); } catch { /* ignore */ }
+    try {
+      rl.question(query, (ans) => done(ans));
+    } catch {
+      done('');
+    }
+  });
+}
+
 // ---------- auth gate (duress handled here for EVERY auth prompt) ----------
 function handleDuress(dataDir) {
   try {
     appendEvent(dataDir, makeDuressEvent());
   } catch { /* silent log is best-effort */ }
   console.log(DURESS_MESSAGE);
+  replSawDuress = true; // only read inside the REPL; one-shot behavior unchanged
   process.exit(0);
 }
 async function requireAuth(dataDir) {
@@ -486,6 +574,28 @@ async function cmdStart(rest) {
   else ui.dim('No canary directories deployed. Use "ducgo deploy <dir>" to add tripwires.');
   emit(makeEvent('system', 'engine', '127.0.0.1', `Trap mesh started - TCP [${enabledPorts.join(', ')}], HTTP 127.0.0.1:${httpPort}`, 'low'));
   console.log(ui.bold('Trap mesh running. Press Ctrl+C to stop.'));
+  if (replActive && replRl) {
+    // REPL: the prompt is blocked while the engine runs (expected). Ctrl+C
+    // stops the engine and RETURNS to the ducgo> prompt (never exits).
+    const rl = replRl;
+    if (!rl.closed) {
+      await new Promise((resolve) => {
+        const done = () => {
+          replStopResolver = null;
+          try { rl.removeListener('close', done); } catch { /* ignore */ }
+          resolve();
+        };
+        replStopResolver = done;
+        try { rl.once('close', done); } catch { /* ignore */ }
+      });
+    }
+    replStopResolver = null;
+    for (const w of watchers) { try { w.close(); } catch { /* ignore */ } }
+    for (const s of servers) await closeServer(s);
+    try { appendEvent(dataDir, makeEvent('system', 'engine', '127.0.0.1', 'Trap mesh stopped', 'low')); } catch { /* ignore */ }
+    ui.dim('\nTrap mesh stopped.');
+    return;
+  }
   let stopping = false;
   const cleanupAndExit = async (code) => {
     if (stopping) return;
@@ -807,6 +917,25 @@ async function cmdEventsTail(rest) {
       }
     } catch { /* ignore */ }
   }, 800);
+  if (replActive && replRl) {
+    // REPL: Ctrl+C stops following and returns to the ducgo> prompt.
+    const rl = replRl;
+    if (!rl.closed) {
+      await new Promise((resolve) => {
+        const done = () => {
+          replStopResolver = null;
+          try { rl.removeListener('close', done); } catch { /* ignore */ }
+          resolve();
+        };
+        replStopResolver = done;
+        try { rl.once('close', done); } catch { /* ignore */ }
+      });
+    }
+    replStopResolver = null;
+    clearInterval(timer);
+    ui.dim('Stopped following.');
+    return;
+  }
   await new Promise(() => {});
   clearInterval(timer);
 }
@@ -1263,38 +1392,265 @@ async function cmdSupport(rest) {
   console.log(ui.box('support', ['scope: passive tripwires on your own machines only', 'no offensive use - this tool never scans or attacks', 'check "ducgo doctor" + "ducgo about" for limits first']));
 }
 
+// Command dispatch table (exactly 70 entries). Shared by one-shot mode and
+// the interactive REPL so both modes run the SAME handler path.
+const HANDLERS = {
+  setup: cmdSetup, 'login-test': cmdLoginTest, 'change-pin': cmdChangePin, 'change-duress': cmdChangeDuress,
+  'lock-status': cmdLockStatus, 'auth-status': cmdAuthStatus, 'reset-all': cmdResetAll,
+  start: cmdStart, status: cmdStatus, 'ports-list': cmdPortsList, 'engine-check': cmdEngineCheck,
+  'trap-list': cmdTrapList, 'trap-add': cmdTrapAdd, 'trap-remove': cmdTrapRemove, 'trap-enable': cmdTrapEnable,
+  'trap-disable': cmdTrapDisable, 'http-show': cmdHttpShow, 'http-config': cmdHttpConfig, 'banner-set': cmdBannerSet,
+  'banner-show': cmdBannerShow, deploy: cmdDeploy, 'canary-list': cmdCanaryList, 'canary-verify': cmdCanaryVerify,
+  'canary-refresh': cmdCanaryRefresh, 'canary-remove': cmdCanaryRemove, 'canary-show': cmdCanaryShow,
+  events: cmdEvents, 'events-tail': cmdEventsTail, 'event-show': cmdEventShow, 'events-clear': cmdEventsClear,
+  'events-export': cmdEventsExport, 'events-import': cmdEventsImport, 'events-stats': cmdEventsStats,
+  attackers: cmdAttackers, 'attacker-show': cmdAttackerShow, 'attacker-note': cmdAttackerNote,
+  'attacker-list-notes': cmdAttackerListNotes, 'top-attackers': cmdTopAttackers,
+  'report-daily': cmdReportDaily, 'report-summary': cmdReportSummary, 'report-top': cmdReportTop, 'report-export': cmdReportExport,
+  'config-set': cmdConfigSet, 'config-get': cmdConfigGet, 'config-list': cmdConfigList, 'config-reset': cmdConfigReset,
+  'data-dir': cmdDataDir, 'data-size': cmdDataSize, 'config-export': cmdConfigExport, 'config-import': cmdConfigImport,
+  help: cmdHelp, banner: cmdBannerCmd, version: cmdVersion, commands: cmdCommands, doctor: cmdDoctor,
+  selftest: cmdSelftest, demo: cmdDemo, about: cmdAbout, backup: cmdBackup, restore: cmdRestore, wipe: cmdWipe,
+  'log-path': cmdLogPath, sysinfo: cmdSysinfo, uptime: cmdUptime, tips: cmdTips, license: cmdLicense,
+  'verify-install': cmdVerifyInstall, paths: cmdPaths, stats: cmdStats, support: cmdSupport,
+};
+
+// ================= INTERACTIVE SHELL =================
+// Bare `ducgo` (no arguments) enters a persistent REPL instead of printing
+// help-and-exit. Every line is parsed quote-aware and dispatched through the
+// SAME handlers as one-shot mode, so behavior (incl. auth/duress) is identical.
+// No new user-facing commands: the registry stays exactly 70.
+export function splitReplLine(line) {
+  const out = [];
+  let cur = '';
+  let quote = null; // null | '"' | "'"
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === '\\' && i + 1 < line.length) { cur += line[i + 1]; i++; continue; }
+      if (ch === quote) { quote = null; continue; }
+      cur += ch;
+      continue;
+    }
+    if (ch === '\\' && i + 1 < line.length) { cur += line[i + 1]; i++; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === ' ' || ch === '\t') {
+      if (cur !== '') { out.push(cur); cur = ''; }
+      continue;
+    }
+    cur += ch;
+  }
+  if (quote) throw new Error(`Unclosed quote in: ${line}`);
+  if (cur !== '') out.push(cur);
+  return out;
+}
+function editDistance(a, b) {
+  const m = a.length; const n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 1; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+function suggestCommands(name) {
+  const scored = COMMAND_NAMES.map((c) => {
+    let bonus = 0;
+    if (c.startsWith(name)) bonus = -100;
+    else if (c.includes(name)) bonus = -50;
+    return { c, score: bonus + editDistance(name, c) };
+  });
+  scored.sort((a, b) => a.score - b.score);
+  return scored.slice(0, 5).map((s) => s.c);
+}
+function loadReplHistory(rl, historyFile) {
+  try {
+    const raw = fs.readFileSync(historyFile, 'utf8');
+    const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-500);
+    // rl.history is newest-first; the file is oldest-first.
+    rl.history.push(...lines.reverse());
+  } catch { /* missing/unreadable history (or pipes) -> start empty */ }
+}
+function appendReplHistory(historyFile, line) {
+  try {
+    ensureDataDir(path.dirname(historyFile));
+    let lines = [];
+    try {
+      lines = fs.readFileSync(historyFile, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '');
+    } catch { /* no history file yet */ }
+    lines.push(line.trim());
+    lines = lines.slice(-500);
+    fs.writeFileSync(historyFile, lines.join('\n') + '\n', 'utf8');
+  } catch { /* history is best-effort; never break the shell */ }
+}
+// One REPL line, dispatched through the SAME handlers as one-shot mode.
+// Returns 'quit' when the shell should close, 'more' otherwise.
+async function replHandleLine(rawLine, ctx) {
+  const { rl, historyFile, realExit } = ctx;
+  const trimmed = rawLine.trim();
+  if (trimmed === '') return 'more';
+  let tokens;
+  try {
+    tokens = splitReplLine(trimmed);
+  } catch (e) {
+    ui.err(String((e && e.message) || e));
+    return 'more';
+  }
+  if (tokens.length === 0) return 'more';
+  const cmd = tokens[0];
+  const rest = tokens.slice(1);
+  if (cmd === 'exit' || cmd === 'quit' || cmd === 'q') return 'quit';
+  appendReplHistory(historyFile, trimmed);
+  const fn = HANDLERS[cmd];
+  if (!fn) {
+    ui.err(`Unknown command: ${cmd}`);
+    const sug = suggestCommands(cmd);
+    if (sug.length > 0) console.log(ui.dim(`Did you mean: ${sug.join(', ')}?`));
+    return 'more';
+  }
+  replSawDuress = false;
+  process.exit = ((code) => { throw new ReplExit(code); });
+  try {
+    await fn(rest);
+  } catch (e) {
+    if (e instanceof ReplExit) {
+      if (e.code === 0 && replSawDuress) {
+        // Duress all-clear: same message + silent alert as one-shot, exit 0.
+        process.exit = realExit;
+        replSawDuress = false;
+        try { rl.close(); } catch { /* ignore */ }
+        realExit(0);
+        return 'quit';
+      }
+      // Any other in-command exit (usage errors, failed auth, engine stop):
+      // the message is already printed - the shell survives.
+    } else {
+      console.error(`Error: ${String((e && e.message) || e)}`);
+    }
+  } finally {
+    process.exit = realExit;
+    replSawDuress = false;
+    replStopResolver = null;
+    replCancelPrompt = null;
+  }
+  return 'more';
+}
+async function runRepl() {
+  const dataDir = getDataDir();
+  const historyFile = path.join(dataDir, 'history');
+  ui.printBanner();
+  console.log(ui.dim('Interactive shell. Type "exit" to quit. "start" blocks the prompt until Ctrl+C.'));
+  replPipedMode = !process.stdin.isTTY;
+  replAbort = false;
+  if (replPipedMode) {
+    // Drain piped stdin once: command lines and sub-prompts share this stream.
+    try {
+      replPipeLines = fs.readFileSync(0, 'utf8').split(/\r?\n/);
+    } catch {
+      replPipeLines = [];
+    }
+    replPipeIdx = 0;
+  } else {
+    replPipeLines = null;
+    replPipeIdx = 0;
+  }
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+    historySize: 500,
+    completer: (line) => {
+      const t = line.trim();
+      const hits = COMMAND_NAMES.filter((c) => c.startsWith(t));
+      return [hits.length > 0 ? hits : COMMAND_NAMES.slice(), line];
+    },
+  });
+  replActive = true;
+  replRl = rl;
+  replSawDuress = false;
+  replStopResolver = null;
+  replCancelPrompt = null;
+  loadReplHistory(rl, historyFile);
+  const realExit = process.exit.bind(process);
+  const ctx = { rl, historyFile, realExit };
+  let lastSigint = 0;
+  let replDone = false;
+  rl.on('SIGINT', () => {
+    // While the engine (or follow) runs, first Ctrl+C stops it - never exits.
+    if (replStopResolver) {
+      const stop = replStopResolver;
+      replStopResolver = null;
+      try { stop(); } catch { /* ignore */ }
+      return;
+    }
+    // Ctrl+C inside a PIN/confirm sub-prompt aborts that prompt; the failing
+    // command then reports its error and the shell survives.
+    if (replCancelPrompt) {
+      const cancel = replCancelPrompt;
+      replCancelPrompt = null;
+      try { cancel(''); } catch { /* ignore */ }
+      return;
+    }
+    const now = Date.now();
+    if (now - lastSigint < 2000) {
+      replDone = true;
+      replAbort = true;
+      if (replPipedMode) realExit(0);
+      else try { rl.close(); } catch { /* ignore */ }
+      return;
+    }
+    lastSigint = now;
+    console.log('(type exit to quit)');
+    if (!replPipedMode) {
+      try { rl.prompt(); } catch { /* ignore */ }
+    }
+  });
+  if (replPipedMode) {
+    for (;;) {
+      if (replAbort || replPipeIdx >= replPipeLines.length) break;
+      const rawLine = replPipeLines[replPipeIdx++];
+      if (rawLine.trim() === '') continue;
+      try { process.stdout.write('ducgo> ' + rawLine.replace(/\r$/, '') + '\n'); } catch { /* ignore */ }
+      const r = await replHandleLine(rawLine, ctx);
+      if (r === 'quit' || replAbort) break;
+    }
+  } else {
+    rl.setPrompt('ducgo> ');
+    rl.prompt();
+    for await (const rawLine of rl) {
+      const r = await replHandleLine(rawLine, ctx);
+      if (r === 'quit' || replDone || replAbort) break;
+      if (!replDone) {
+        try { rl.prompt(); } catch { /* ignore */ }
+      }
+    }
+  }
+  replRl = null;
+  replActive = false;
+  replStopResolver = null;
+  replCancelPrompt = null;
+  replPipeLines = null;
+  replPipeIdx = 0;
+  try { rl.close(); } catch { /* ignore */ }
+}
+
 // ---------- main ----------
 async function main() {
   const args = process.argv.slice(2);
+  if (args.length === 0) { await runRepl(); return; }
   const cmd = args[0];
   const rest = args.slice(1);
-  if (!cmd || cmd === '--help' || cmd === '-h' || cmd === 'help' && rest.length === 0) {
-    if (!cmd || cmd === '--help' || cmd === '-h') { printHelp(); return; }
+  if (cmd === '--help' || cmd === '-h' || cmd === 'help' && rest.length === 0) {
+    if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
   }
   if (cmd === '--version' || cmd === '-V') { console.log(`ducgo v${VERSION}`); return; }
-  const handlers = {
-    setup: cmdSetup, 'login-test': cmdLoginTest, 'change-pin': cmdChangePin, 'change-duress': cmdChangeDuress,
-    'lock-status': cmdLockStatus, 'auth-status': cmdAuthStatus, 'reset-all': cmdResetAll,
-    start: cmdStart, status: cmdStatus, 'ports-list': cmdPortsList, 'engine-check': cmdEngineCheck,
-    'trap-list': cmdTrapList, 'trap-add': cmdTrapAdd, 'trap-remove': cmdTrapRemove, 'trap-enable': cmdTrapEnable,
-    'trap-disable': cmdTrapDisable, 'http-show': cmdHttpShow, 'http-config': cmdHttpConfig, 'banner-set': cmdBannerSet,
-    'banner-show': cmdBannerShow, deploy: cmdDeploy, 'canary-list': cmdCanaryList, 'canary-verify': cmdCanaryVerify,
-    'canary-refresh': cmdCanaryRefresh, 'canary-remove': cmdCanaryRemove, 'canary-show': cmdCanaryShow,
-    events: cmdEvents, 'events-tail': cmdEventsTail, 'event-show': cmdEventShow, 'events-clear': cmdEventsClear,
-    'events-export': cmdEventsExport, 'events-import': cmdEventsImport, 'events-stats': cmdEventsStats,
-    attackers: cmdAttackers, 'attacker-show': cmdAttackerShow, 'attacker-note': cmdAttackerNote,
-    'attacker-list-notes': cmdAttackerListNotes, 'top-attackers': cmdTopAttackers,
-    'report-daily': cmdReportDaily, 'report-summary': cmdReportSummary, 'report-top': cmdReportTop, 'report-export': cmdReportExport,
-    'config-set': cmdConfigSet, 'config-get': cmdConfigGet, 'config-list': cmdConfigList, 'config-reset': cmdConfigReset,
-    'data-dir': cmdDataDir, 'data-size': cmdDataSize, 'config-export': cmdConfigExport, 'config-import': cmdConfigImport,
-    help: cmdHelp, banner: cmdBannerCmd, version: cmdVersion, commands: cmdCommands, doctor: cmdDoctor,
-    selftest: cmdSelftest, demo: cmdDemo, about: cmdAbout, backup: cmdBackup, restore: cmdRestore, wipe: cmdWipe,
-    'log-path': cmdLogPath, sysinfo: cmdSysinfo, uptime: cmdUptime, tips: cmdTips, license: cmdLicense,
-    'verify-install': cmdVerifyInstall, paths: cmdPaths, stats: cmdStats, support: cmdSupport,
-  };
   if (cmd === 'help') { await cmdHelp(rest); return; }
   if (cmd === '--help' || cmd === '-h') { printHelp(); return; }
-  const fn = handlers[cmd];
+  const fn = HANDLERS[cmd];
   if (!fn) {
     console.error(`Unknown command: ${cmd}\n`);
     printGroupedCommands();

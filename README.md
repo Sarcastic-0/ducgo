@@ -67,6 +67,39 @@ node src/cli.js demo
 node src/cli.js commands --count   # -> 70
 ```
 
+## Interactive shell
+
+Running bare `ducgo` (no arguments) prints the banner once and enters a
+persistent `ducgo> ` prompt. It stays open until `exit`, `quit`, or `q`,
+a second `Ctrl+C` within 2 seconds, or EOF (exit code 0). Piped stdin works
+too: lines are executed in order and the shell exits at EOF.
+
+```powershell
+node src/cli.js
+# ducgo> version
+# ducgo> commands --count   # -> 70
+# ducgo> attacker-note 1.2.3.4 "suspicious login"
+# ducgo> exit
+
+"banner`nversion`ncommands --count`nquit`n" | node src/cli.js
+```
+
+Notes:
+
+- Every line is parsed quote-aware (`"double"`, `'single'`, `\` escapes) and
+  dispatched through the same handlers as one-shot mode, so behavior is
+  identical - including PIN prompts for auth-gated commands (hidden input on
+  a TTY; PIN answers never touch the history file) and the unchanged duress
+  all-clear (`All clear - no threats detected.`, silent alert, exit 0).
+- `start` blocks the prompt while the engine runs - that is expected. `Ctrl+C`
+  stops the engine and returns to the `ducgo> ` prompt (it does not exit the
+  shell). A first `Ctrl+C` at an idle prompt prints `(type exit to quit)`.
+- Unknown commands print an error plus up to 5 suggestions; per-line errors
+  never kill the shell. Tab completion covers all 70 command names; history
+  persists at `<dataDir>\history` (capped at ~500 lines, best-effort).
+- One-shot mode (`ducgo <command> [options]`) is unchanged, and no new
+  user-facing commands were added - the registry stays exactly 70.
+
 ## 70 commands
 
 `ducgo commands` prints the grouped list. `ducgo commands --count` prints `70`.

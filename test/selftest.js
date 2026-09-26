@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { setupPins, verifyPin } from '../src/auth.js';
 import { startHoneyTcp, startHoneyHttp, getServerPort, watchDirs, deployCanaries, closeServer } from '../src/traps.js';
-import { COMMANDS } from '../src/cli.js';
+import { COMMANDS, splitReplLine } from '../src/cli.js';
 import { banner, TAGLINE, VERSION, table, box, formatEvent, progress } from '../src/ui.js';
 
 let failures = 0;
@@ -206,6 +206,104 @@ function testCommandsCountCli() {
   assert(r.status === 0 && String(r.stdout || '').trim() === '70', 'cli: commands --count prints exactly 70');
 }
 
+function testReplQuoteParsing() {
+  assert(
+    JSON.stringify(splitReplLine('attacker-note 1.2.3.4 "hello world"')) === JSON.stringify(['attacker-note', '1.2.3.4', 'hello world']),
+    'repl: double quotes group one argument'
+  );
+  assert(
+    JSON.stringify(splitReplLine("banner-set 2222 'a b c'")) === JSON.stringify(['banner-set', '2222', 'a b c']),
+    'repl: single quotes group one argument'
+  );
+  assert(
+    JSON.stringify(splitReplLine('a "b\\"c" d\\ e')) === JSON.stringify(['a', 'b"c', 'd e']),
+    'repl: backslash escapes work in and out of quotes'
+  );
+  let threw = false;
+  try {
+    splitReplLine('events "unclosed');
+  } catch {
+    threw = true;
+  }
+  assert(threw, 'repl: unclosed quote is a per-line error');
+}
+
+// Piped REPL: feed lines on stdin, session must execute each, survive the
+// unknown command, and exit 0 at quit/EOF. Scratch MIRAGENET_DIR only.
+function testReplPiped() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-repl-'));
+  try {
+    const input = 'banner\nversion\ncommands --count\nboguscmd\nquit\n';
+    const r = spawnSync(process.execPath, [cliPath()], {
+      input,
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, MIRAGENET_DIR: dir },
+    });
+    const out = String(r.stdout || '') + String(r.stderr || '');
+    assert(r.status === 0, 'repl: piped session exits 0', `status=${r.status} out=${out.slice(0, 500)}`);
+    assert(out.includes(TAGLINE) || out.includes('██'), 'repl: piped session prints the banner once');
+    assert(out.includes(`ducgo v${VERSION}`), 'repl: piped session prints ducgo v2.0.0');
+    assert(out.split(/\r?\n/).some((l) => l.trim() === '70'), 'repl: commands --count prints 70 inside REPL');
+    assert(out.toLowerCase().includes('unknown command'), 'repl: unknown command reported, shell survives it');
+    assert(out.includes('ducgo> '), 'repl: prompt loop shown (ducgo> )');
+    assert(fs.existsSync(path.join(dir, 'history')), 'repl: history persisted at <dataDir>/history');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Piped REPL with auth: setup consumes PIN lines, a PIN-gated command works
+// with a quoted argument, duress keeps its all-clear behavior.
+function testReplAuthPiped() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-repl-auth-'));
+  try {
+    const input = [
+      'setup', 'alpha-9912', 'alpha-9912', 'duress-4417', 'duress-4417',
+      'attacker-note 1.2.3.4 "hello world test"', 'alpha-9912',
+      'quit',
+    ].join('\n') + '\n';
+    const r = spawnSync(process.execPath, [cliPath()], {
+      input,
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, MIRAGENET_DIR: dir },
+    });
+    const out = String(r.stdout || '') + String(r.stderr || '');
+    assert(r.status === 0, 'repl: auth session exits 0', `status=${r.status} out=${out.slice(0, 800)}`);
+    assert(out.includes('Setup complete'), 'repl: setup works inside the shell');
+    assert(out.includes('Note saved for 1.2.3.4'), 'repl: PIN-gated command + quoted arg work inside the shell');
+
+    const input2 = ['events', 'duress-4417', 'quit'].join('\n') + '\n';
+    const r2 = spawnSync(process.execPath, [cliPath()], {
+      input: input2,
+      encoding: 'utf8',
+      timeout: 30000,
+      env: { ...process.env, MIRAGENET_DIR: dir },
+    });
+    const out2 = String(r2.stdout || '') + String(r2.stderr || '');
+    assert(r2.status === 0, 'repl: duress session exits 0');
+    assert(out2.includes('All clear - no threats detected.'), 'repl: duress all-clear UNCHANGED inside the shell');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function testOneShotStillFine() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-oneshot-'));
+  try {
+    const env = { ...process.env, MIRAGENET_DIR: dir };
+    const v = spawnSync(process.execPath, [cliPath(), 'version'], { encoding: 'utf8', timeout: 15000, env });
+    assert(v.status === 0 && String(v.stdout || '').includes(`ducgo v${VERSION}`), 'cli: one-shot version unchanged');
+    const c = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8', timeout: 15000, env });
+    assert(c.status === 0 && String(c.stdout || '').trim() === '70', 'cli: one-shot commands --count still 70');
+    const u = spawnSync(process.execPath, [cliPath(), 'boguscmd'], { encoding: 'utf8', timeout: 15000, env });
+    assert(u.status === 1 && (String(u.stdout || '') + String(u.stderr || '')).toLowerCase().includes('unknown command'), 'cli: one-shot unknown still exits 1');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 function testSmokeHelp() {
   for (const c of COMMANDS) {
     const r = spawnSync(process.execPath, [cliPath(), c.name, '--help'], { encoding: 'utf8', timeout: 15000 });
@@ -227,6 +325,10 @@ export async function runSelfTest() {
   testBanner();
   testUiEverywhere();
   testCommandsCountCli();
+  testReplQuoteParsing();
+  testReplPiped();
+  testReplAuthPiped();
+  testOneShotStillFine();
   testSmokeHelp();
   console.log(`\n${passes} check(s) passed.`);
   if (failures === 0) {
