@@ -529,8 +529,13 @@ async function requireAuth(dataDir) {
 }
 
 // ---------- shared printers ----------
+// In the interactive REPL the banner already printed once at startup —
+// help-like output shows results only. Explicit `banner` still prints it.
+function maybeBanner() {
+  if (!replActive) ui.printBanner();
+}
 function printGroupedCommands() {
-  ui.printBanner();
+  maybeBanner();
   console.log('');
   const groups = ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system', 'sentinel', 'integrity'];
   for (const g of groups) {
@@ -566,7 +571,7 @@ async function printExtrasFooter() {
   } catch { /* footer is best-effort */ }
 }
 function printHelp() {
-  ui.printBanner();
+  maybeBanner();
   console.log('');
   console.log(`ducgo v${VERSION} - passive deception tripwires (CLI only, English only)`);
   console.log('');
@@ -590,7 +595,7 @@ function printHelp() {
 function cmdUsage(name) {
   const c = findCmd(name);
   if (c) {
-    ui.printBanner();
+    maybeBanner();
     console.log('');
     console.log(ui.bold(`ducgo ${c.name}`) + ` - ${c.desc}`);
     console.log(`Usage: ${c.usage}`);
@@ -598,7 +603,7 @@ function cmdUsage(name) {
   }
   const ex = findExtraBuiltin(name);
   if (ex) {
-    ui.printBanner();
+    maybeBanner();
     console.log('');
     console.log(ui.bold(`ducgo ${ex.name}`) + ` - ${ex.desc} [extra, never counted in the 86]`);
     console.log(`Usage: ${ex.usage}`);
@@ -611,7 +616,7 @@ async function cmdUsageExtra(name) {
   const dataDir = getDataDir();
   const cfg = loadConfig(dataDir);
   if (cfg.aliases && cfg.aliases[name] !== undefined) {
-    ui.printBanner();
+    maybeBanner();
     console.log('');
     console.log(ui.bold(`ducgo ${name}`) + ' - alias [extra, never counted]');
     console.log(`Expands to: ${cfg.aliases[name]}`);
@@ -619,7 +624,7 @@ async function cmdUsageExtra(name) {
     return;
   }
   if (cfg.macros && cfg.macros[name] !== undefined) {
-    ui.printBanner();
+    maybeBanner();
     console.log('');
     console.log(ui.bold(`ducgo ${name}`) + ' - macro [extra, never counted]');
     console.log(`Runs (; -separated): ${cfg.macros[name]}`);
@@ -630,7 +635,7 @@ async function cmdUsageExtra(name) {
     const loaded = await loadPlugins(dataDir);
     if (loaded.cmdMap.has(name)) {
       const entry = loaded.cmdMap.get(name);
-      ui.printBanner();
+      maybeBanner();
       console.log('');
       console.log(ui.bold(`ducgo ${name}`) + ` - ${entry.def.desc} [plugin: ${entry.pluginName}, group plugin-cmd]`);
       console.log(`Usage: ${entry.def.usage || `ducgo ${name}`}`);
@@ -638,7 +643,7 @@ async function cmdUsageExtra(name) {
     }
     for (const p of loaded.plugins) {
       if (p.name === name || p.id === name) {
-        ui.printBanner();
+        maybeBanner();
         console.log('');
         console.log(ui.bold(`plugin ${p.name}`) + ` - v${p.version || '0'} [${p.enabled ? 'enabled' : 'disabled'}]`);
         console.log(`Commands: ${p.commands.join(', ') || '(none)'}`);
@@ -2010,7 +2015,7 @@ async function cmdDemo(rest) {
 }
 async function cmdAbout(rest) {
   if (wantsHelp(rest)) return cmdUsage('about');
-  ui.printBanner();
+  maybeBanner();
   console.log('');
   console.log(ui.box('about ducgo', ['passive deception tripwires: honey TCP + honey HTTP + canary files', '100% passive/defensive - only listens locally, never scans or attacks', 'English only. CLI only. Zero runtime dependencies (Node stdlib only).']));
   console.log(ui.dim('Limits: fs.watch sees modify/rename/delete only (NOT silent reads); TCP ports are LAN-visible by design;'));

@@ -257,6 +257,32 @@ function testReplPiped() {
   }
 }
 
+// REPL prints the logo once (startup); help/commands add none.
+// Explicit `banner` still prints it; one-shot help keeps it.
+function testReplNoRepeatLogo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-repllogo-'));
+  try {
+    const countTag = (s) => (s.match(/No one can race me/g) || []).length;
+    const run = (input) =>
+      spawnSync(process.execPath, [cliPath()], {
+        input,
+        encoding: 'utf8',
+        timeout: 30000,
+        env: { ...process.env, MIRAGENET_DIR: dir },
+      });
+    const rHelp = run('help\nquit\n');
+    const rCmds = run('commands\nquit\n');
+    const rBanner = run('banner\nquit\n');
+    const rOne = spawnSync(process.execPath, [cliPath(), 'help'], { encoding: 'utf8', timeout: 30000 });
+    assert(rHelp.status === 0 && countTag(String(rHelp.stdout || '')) === 1, 'repl: help adds no logo (startup only)');
+    assert(rCmds.status === 0 && countTag(String(rCmds.stdout || '')) === 1, 'repl: commands adds no logo (startup only)');
+    assert(rBanner.status === 0 && countTag(String(rBanner.stdout || '')) === 2, 'repl: explicit banner still prints the logo');
+    assert(rOne.status === 0 && countTag(String(rOne.stdout || '')) === 1, 'one-shot: help keeps its logo');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // Piped REPL with auth: setup consumes PIN lines, a PIN-gated command works
 // with a quoted argument, duress keeps its all-clear behavior.
 function testReplAuthPiped() {
@@ -881,6 +907,7 @@ export async function runSelfTest() {
   testCommandsCountCli();
   testReplQuoteParsing();
   testReplPiped();
+  testReplNoRepeatLogo();
   testReplAuthPiped();
   testOneShotStillFine();
   testSetupRetry();
