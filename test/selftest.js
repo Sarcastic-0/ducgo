@@ -7,10 +7,11 @@ import * as path from 'node:path';
 import * as http from 'node:http';
 import * as net from 'node:net';
 import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 import { setupPins, verifyPin } from '../src/auth.js';
 import { startHoneyTcp, startHoneyHttp, getServerPort, watchDirs, deployCanaries, closeServer } from '../src/traps.js';
 import { COMMANDS, EXTRA_BUILTINS, splitReplLine } from '../src/cli.js';
+import * as sniff from '../src/sniff.js';
 import { banner, TAGLINE, VERSION, table, box, formatEvent, progress } from '../src/ui.js';
 
 let failures = 0;
@@ -167,9 +168,9 @@ async function testCanary() {
 
 // (4) ducgo v3: command count + UI + smoke
 function testCount() {
-  assert(COMMANDS.length === 86, `commands: count==86 (got ${COMMANDS.length})`);
+  assert(COMMANDS.length === 92, `commands: count==92 (got ${COMMANDS.length})`);
   const names = COMMANDS.map((c) => c.name);
-  assert(new Set(names).size === 86, 'commands: all names unique');
+  assert(new Set(names).size === 92, 'commands: all names unique');
   for (const g of ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system', 'sentinel', 'integrity']) {
     assert(COMMANDS.some((c) => c.group === g), `commands: group present (${g})`);
   }
@@ -207,7 +208,7 @@ function cliPath() {
 
 function testCommandsCountCli() {
   const r = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8' });
-  assert(r.status === 0 && String(r.stdout || '').trim() === '86', 'cli: commands --count prints exactly 86');
+  assert(r.status === 0 && String(r.stdout || '').trim() === '92', 'cli: commands --count prints exactly 92');
 }
 
 function testReplQuoteParsing() {
@@ -248,7 +249,7 @@ function testReplPiped() {
     assert(r.status === 0, 'repl: piped session exits 0', `status=${r.status} out=${out.slice(0, 500)}`);
     assert(out.includes(TAGLINE) || out.includes('██'), 'repl: piped session prints the banner once');
     assert(out.includes(`ducgo v${VERSION}`), 'repl: piped session prints ducgo v3.0.4');
-    assert(out.split(/\r?\n/).some((l) => l.trim() === '86'), 'repl: commands --count prints 86 inside REPL');
+    assert(out.split(/\r?\n/).some((l) => l.trim() === '92'), 'repl: commands --count prints 92 inside REPL');
     assert(out.toLowerCase().includes('unknown command'), 'repl: unknown command reported, shell survives it');
     assert(out.includes('ducgo> '), 'repl: prompt loop shown (ducgo> )');
     assert(fs.existsSync(path.join(dir, 'history')), 'repl: history persisted at <dataDir>/history');
@@ -326,7 +327,7 @@ function testOneShotStillFine() {
     const v = spawnSync(process.execPath, [cliPath(), 'version'], { encoding: 'utf8', timeout: 15000, env });
     assert(v.status === 0 && String(v.stdout || '').includes(`ducgo v${VERSION}`), 'cli: one-shot version unchanged');
     const c = spawnSync(process.execPath, [cliPath(), 'commands', '--count'], { encoding: 'utf8', timeout: 15000, env });
-    assert(c.status === 0 && String(c.stdout || '').trim() === '86', 'cli: one-shot commands --count still 86');
+    assert(c.status === 0 && String(c.stdout || '').trim() === '92', 'cli: one-shot commands --count still 92');
     const u = spawnSync(process.execPath, [cliPath(), 'boguscmd'], { encoding: 'utf8', timeout: 15000, env });
     assert(u.status === 1 && (String(u.stdout || '') + String(u.stderr || '')).toLowerCase().includes('unknown command'), 'cli: one-shot unknown still exits 1');
   } finally {
@@ -587,12 +588,12 @@ function testCountWithExtras() {
     runCli(dir, ['plugin-enable', 'hello-plugin'], PIN + '\n');
     runCli(dir, ['alias', 'set', 'll', 'version'], PIN + '\n');
     runCli(dir, ['macro', 'set', 'daily', 'version; banner'], PIN + '\n');
-    assert(COMMANDS.length === 86, 'contract: built-ins exactly 86');
+    assert(COMMANDS.length === 92, 'contract: built-ins exactly 92');
     const c = runCli(dir, ['commands', '--count']);
-    assert(c.status === 0 && String(c.stdout || '').trim() === '86', 'contract: commands --count stays 86 with extras');
+    assert(c.status === 0 && String(c.stdout || '').trim() === '92', 'contract: commands --count stays 92 with extras');
     const full = runCli(dir, ['commands']);
     const fullOut = String(full.stdout || '') + String(full.stderr || '');
-    assert(full.status === 0 && fullOut.includes('Total: 86'), 'contract: grouped list still 86');
+    assert(full.status === 0 && fullOut.includes('Total: 92'), 'contract: grouped list still 92');
     assert(/\+ \d+ plugin command\(s\)/i.test(fullOut), 'contract: footer line for extras');
     assert(/\+ [1-9]\d* plugin command\(s\)/i.test(fullOut), 'contract: footer shows enabled plugin count');
   } finally {
@@ -887,10 +888,155 @@ async function testSentinelLive() {
     });
     const replOut = String(repl.stdout || '') + String(repl.stderr || '');
     assert(repl.status === 0, 'sentinel-live: REPL spot check exits 0');
-    assert(replOut.split(/\r?\n/).some((l) => l.trim() === '86'), 'sentinel-live: REPL count==86');
+    assert(replOut.split(/\r?\n/).some((l) => l.trim() === '92'), 'sentinel-live: REPL count==92');
     assert(replOut.includes('ducgo listen'), 'sentinel-live: REPL help listen works');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// ---------- sniff (pktmon parser + analyzer fixtures, no admin needed) ----------
+function testSniff() {
+  const ev = (dir, type, comp, size, body) =>
+    `[09]0004.03F4::2026-09-26 03:52:57.290944700 [Microsoft-Windows-PktMon] PktGroupId 1, PktNumber 1, Appearance 0, Direction ${dir}, Type Ethernet, Component ${comp}, Edge 1, Filter 0, OriginalSize ${size}, LoggedSize 128 \n\t${body}`;
+  const tcp = (sip, sp, dip, dp, flags, size = 200, dir = 'Rx', comp = 40) =>
+    ev(dir, 'Ethernet', comp, size, `AA > BB, ethertype IPv4 (0x0800), length ${size}: ${sip}.${sp} > ${dip}.${dp}: Flags [${flags}], seq 1:2, ack 1, win 1, length 0`);
+
+  // mixed clean fixture: tcp + udp + arp + dns + http
+  const clean = [
+    tcp('192.168.8.41', 5001, '93.184.216.34', 443, 'P.', 300, 'Tx'),
+    tcp('93.184.216.34', 443, '192.168.8.41', 5001, '.', 1400, 'Rx'),
+    ev('Rx', 'Ethernet', 40, 145, 'AA > BB, ethertype IPv4 (0x0800), length 145: 192.168.8.41.62380 > 8.8.8.8.443: \nUDP, length 103'),
+    ev('Rx', 'Ethernet', 40, 42, 'AA > BB, ethertype ARP (0x0806), length 42: Request who-has 192.168.8.41 tell \n192.168.8.1, length 28'),
+    ev('Tx', 'Ethernet', 40, 71, 'AA > BB, ethertype IPv4 (0x0800), length 71: 192.168.8.41.55275 > 8.8.8.8.53: 2+ A? example.com. (29)'),
+    ev('Tx', 'Ethernet', 40, 400, 'AA > BB, ethertype IPv4 (0x0800), length 400: 192.168.8.41.5002 > 93.184.216.34.80: Flags [P.], seq 1:2, ack 1, win 1, length 0 \nGET /index.html HTTP/1.1 Host: example.com'),
+  ].join('\n');
+  const p = sniff.parseEtlText(clean);
+  assert(p.packets === 4, 'sniff: parses 4 packets (3 tcp + 1 udp; arp/dns-headers are not packets)', `got ${p.packets}`);
+  assert(p.tcp === 3 && p.udp === 1, 'sniff: tcp/udp split', `tcp=${p.tcp} udp=${p.udp}`);
+  assert(p.flows.size === 4, 'sniff: 4 flows', `got ${p.flows.size}`);
+  assert(p.dns.has('example.com.'), 'sniff: DNS query captured');
+  assert(p.arpReq.has('192.168.8.41'), 'sniff: wrapped ARP request parsed');
+  const a0 = sniff.analyze(p);
+  assert(a0.anomalies.length === 0, 'sniff: clean traffic, no anomalies', JSON.stringify(a0.anomalies).slice(0, 300));
+
+  // port scan: 16 distinct ports from one src
+  let scan = '';
+  for (let i = 0; i < 16; i++) scan += tcp('10.9.9.9', 40000 + i, '192.168.8.41', 1000 + i, '.', 60) + '\n';
+  const aScan = sniff.analyze(sniff.parseEtlText(scan));
+  assert(aScan.anomalies.some((a) => a.severity === 'high' && /port scan/.test(a.title)), 'sniff: port scan flagged high');
+
+  // SYN scan: 12 unanswered SYNs
+  let syns = '';
+  for (let i = 0; i < 12; i++) syns += tcp('10.9.9.8', 41000 + i, '192.168.8.41', 2000 + i, 'S', 60) + '\n';
+  const aSyn = sniff.analyze(sniff.parseEtlText(syns));
+  assert(aSyn.anomalies.some((a) => /SYN scan/.test(a.title)), 'sniff: SYN scan flagged');
+
+  // sweep: 21 distinct dst IPs
+  let sweep = '';
+  for (let i = 1; i <= 21; i++) sweep += tcp('10.9.9.7', 42000, `192.168.9.${i}`, 445, 'S', 60) + '\n';
+  const aSweep = sniff.analyze(sniff.parseEtlText(sweep));
+  assert(aSweep.anomalies.some((a) => /sweep/.test(a.title)), 'sniff: network sweep flagged');
+
+  // DNS tunneling: 31 subdomains + one over-long name
+  let dnsFix = '';
+  for (let i = 0; i < 31; i++) {
+    dnsFix += ev('Tx', 'Ethernet', 40, 100, `AA > BB, length 100: 192.168.8.41.53${100 + i} > 8.8.8.8.53: 2+ A? part${i}.evil.example. (40)`) + '\n';
+  }
+  dnsFix += ev('Tx', 'Ethernet', 40, 120, 'AA > BB, length 120: 192.168.8.41.53111 > 8.8.8.8.53: 2+ A? ' + 'x'.repeat(65) + '.evil.example. (90)') + '\n';
+  const aDns = sniff.analyze(sniff.parseEtlText(dnsFix));
+  assert(aDns.anomalies.some((a) => /tunneling/.test(a.title) && /subdomains/.test(a.detail)), 'sniff: DNS subdomain storm flagged');
+  assert(aDns.anomalies.some((a) => /tunneling/.test(a.title) && /over-long/.test(a.detail)), 'sniff: over-long DNS name flagged');
+
+  // ARP conflict: one IP, two MACs
+  const arpFix = [
+    ev('Rx', 'Ethernet', 40, 42, 'AA > BB, ethertype ARP (0x0806), length 42: Reply 10.0.0.7 is-at AA-AA-AA-AA-AA-AA'),
+    ev('Rx', 'Ethernet', 40, 42, 'AA > BB, ethertype ARP (0x0806), length 42: Reply 10.0.0.7 is-at BB-BB-BB-BB-BB-BB'),
+  ].join('\n');
+  const aArp = sniff.analyze(sniff.parseEtlText(arpFix));
+  assert(aArp.anomalies.some((a) => /ARP spoofing/.test(a.title)), 'sniff: ARP conflict flagged high');
+
+  // cleartext basic auth
+  const httpFix = ev('Tx', 'Ethernet', 40, 300, 'AA > BB, length 300: 192.168.8.41.5009 > 93.184.216.34.80: Flags [P.], seq 1:2 \nGET /login HTTP/1.1 Host: example.com Authorization: Basic QQ==');
+  const aHttp = sniff.analyze(sniff.parseEtlText(httpFix));
+  assert(aHttp.anomalies.some((a) => /cleartext credential/.test(a.title)), 'sniff: basic-auth on wire flagged');
+  assert(!JSON.stringify(aHttp.anomalies).includes('QQ=='), 'sniff: credential value never stored');
+
+  // env shapes (no admin assumption)
+  assert(typeof sniff.isAdmin() === 'boolean', 'sniff: isAdmin returns boolean');
+  assert(sniff.pktmonExe() === null || typeof sniff.pktmonExe() === 'string', 'sniff: pktmonExe shape');
+  const dst = sniff.driverStatus();
+  assert(typeof dst.present === 'boolean' && typeof dst.admin === 'boolean', 'sniff: driverStatus shape');
+
+  // UTF-16 etl2txt decoding (real pktmon output shape: BOM + wide chars)
+  {
+    const sample = '[09]0004.03F4::2026-09-26 03:52:57.290944700 [Microsoft-Windows-PktMon] PktGroupId 1, PktNumber 1, Appearance 0, Direction Rx, Type Ethernet, Component 40, Edge 1, Filter 0, OriginalSize 255, LoggedSize 128 \n\tAA > BB, ethertype IPv4 (0x0800), length 255: 1.2.3.4.443 > 5.6.7.8.5000: Flags [P.], seq 1:2, ack 1, win 1, length 201\n';
+    const d16 = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-utf16-'));
+    try {
+      const fp = path.join(d16, 'cap.txt');
+      fs.writeFileSync(fp, '﻿' + sample, 'utf16le');
+      const back = sniff.readEtlText(fp);
+      assert(!back.includes(' '), 'sniff: UTF-16 decoded (no NULs)');
+      const p16 = sniff.parseEtlText(back);
+      assert(p16.packets === 1, 'sniff: UTF-16 fixture parses', `got ${p16.packets}`);
+    } finally {
+      fs.rmSync(d16, { recursive: true, force: true });
+    }
+  }
+
+  // live branch: admin -> real 3s capture; non-admin -> clean guidance error
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ducgo-sniff-'));
+  try {
+    const PIN = 'alpha-9912';
+    setupScratch(dir);
+    if (sniff.isAdmin() && sniff.pktmonExe()) {
+      // guaranteed LAN traffic during the window: SYNs to a closed port on our own LAN IP
+      let lan = null;
+      try {
+        for (const ifs of Object.values(os.networkInterfaces())) {
+          for (const a of ifs || []) {
+            if (a.family === 'IPv4' && !a.internal) lan = a.address;
+          }
+        }
+      } catch { lan = null; }
+      let gen = null;
+      if (lan) {
+        try {
+          gen = spawn(process.execPath, ['-e', `const n=require('node:net');let i=0;const t=setInterval(()=>{if(++i>15){clearInterval(t);process.exit(0);}const s=n.connect(9,'${lan}');s.on('error',()=>{});s.on('connect',()=>s.end());},250);`], { windowsHide: true, stdio: 'ignore' });
+        } catch { gen = null; }
+      }
+      const r = runCli(dir, ['sniff', '--duration', '4'], PIN + '\n');
+      try { if (gen) gen.kill(); } catch { /* ignore */ }
+      const out = String(r.stdout || '') + String(r.stderr || '');
+      assert(r.status === 0, 'sniff-live: --duration 4 exits 0 (admin)', out.slice(-600));
+      assert(/packets: \d+/.test(out), 'sniff-live: summary printed');
+      let last = null;
+      try { last = JSON.parse(fs.readFileSync(path.join(dir, 'captures.jsonl'), 'utf8').trim().split('\n').pop()); } catch { last = null; }
+      assert(!!last && typeof last.packets === 'number', 'sniff-live: summary saved');
+      assert(!!last && last.packets > 0, 'sniff-live: real traffic captured (packets>0)', `got ${last && last.packets}`);
+      const rep = runCli(dir, ['sniff-report'], PIN + '\n');
+      assert(rep.status === 0 && String(rep.stdout || '').includes('Last capture'), 'sniff-live: report reads saved capture');
+      const top = runCli(dir, ['sniff-top', '--n', '5'], PIN + '\n');
+      assert(top.status === 0, 'sniff-live: top exits 0');
+      const dns = runCli(dir, ['sniff-dns'], PIN + '\n');
+      assert(dns.status === 0, 'sniff-live: dns exits 0');
+    } else {
+      const r = runCli(dir, ['sniff', '--duration', '3'], PIN + '\n');
+      const out = String(r.stdout || '') + String(r.stderr || '');
+      assert(r.status !== 0 && /Administrator/.test(out), 'sniff: non-admin gets elevation guidance');
+    }
+    const chk = runCli(dir, ['sniff-check']);
+    assert(chk.status === 0 && String(chk.stdout || '').includes('pktmon'), 'sniff: sniff-check needs no PIN');
+    const norep = runCli(dir, ['sniff-report'], 'alpha-9912\n');
+    assert(norep.status === 0 || /No captures yet/.test(String(norep.stdout || '') + String(norep.stderr || '')), 'sniff: report handles empty store');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // smoke: new sniff commands --help exit 0
+  for (const c of ['sniff-check', 'sniff', 'sniff-live', 'sniff-report', 'sniff-top', 'sniff-dns']) {
+    const r = spawnSync(process.execPath, [cliPath(), c, '--help'], { encoding: 'utf8', timeout: 15000 });
+    assert(r.status === 0, `sniff: --help smoke ${c}`);
   }
 }
 
@@ -926,6 +1072,8 @@ export async function runSelfTest() {
   testIntegrityCycle();
   await testVersionExact();
   await testSentinelLive();
+  testSniff();
+  testSniff();
   console.log(`\n${passes} check(s) passed.`);
   if (failures === 0) {
     console.log('SELFTEST PASS - all checks passed');

@@ -77,7 +77,7 @@ $env:MIRAGENET_DIR = "$env:TEMP\ducgo-test"
 "alpha-9912`nalpha-9912`nduress-4417`nduress-4417" | node src/cli.js setup
 node src/cli.js demo
 "alpha-9912" | node src/cli.js deploy "$env:TEMP\ducgo-test\decoys"
-node src/cli.js commands --count   # -> 86
+node src/cli.js commands --count   # -> 92
 ```
 
 ## Interactive shell
@@ -92,7 +92,7 @@ type `banner` anytime to show it again.
 ```powershell
 node src/cli.js
 # ducgo> version
-# ducgo> commands --count   # -> 86
+# ducgo> commands --count   # -> 92
 # ducgo> attacker-note 1.2.3.4 "suspicious login"
 # ducgo> exit
 
@@ -115,12 +115,12 @@ Notes:
   shown); history persists at `<dataDir>\history` (capped at ~500 lines,
   best-effort).
 - One-shot mode (`ducgo <command> [options]`) is unchanged. The registry
-  stays exactly 86 built-ins; extras (plugin mgmt, completion, alias, macro,
+  stays exactly 92 built-ins; extras (plugin mgmt, completion, alias, macro,
   plugin commands) are never counted - see the `commands` footer line.
 
-## 86 commands
+## 92 commands
 
-`ducgo commands` prints the grouped list. `ducgo commands --count` prints `86`.
+`ducgo commands` prints the grouped list. `ducgo commands --count` prints `92`.
 Every command supports `--help` (exits 0, no side effects).
 
 ### auth (7)
@@ -233,7 +233,7 @@ Foreground only - there is no `start-bg`/daemon. `status` checks ports; stop wit
 | `help [command]` | Banner + help (or one command's usage) |
 | `banner` | Print the DUCGO banner |
 | `version` | Print `ducgo v3.0.4` |
-| `commands [--count]` | Grouped one-liners; `--count` prints `86` |
+| `commands [--count]` | Grouped one-liners; `--count` prints `92` |
 | `doctor` | Node/data-dir/auth/ports health checks |
 | `selftest` | Built-in suite (same as `npm test`) |
 | `demo` | One synthetic `DEMO` event (no PIN) |
@@ -285,7 +285,8 @@ Honest sentinel notes (read before trusting alerts):
   rotations, and hosts edits all have benign causes (updates, DHCP, mesh /
   repeaters, CDN rotation, VPNs). Confirm unknown MACs / BSSIDs against your
   router admin page before acting.
-- No packet capture is used or claimed. For real sniffing use a companion
+- No packet capture is used or claimed by the sentinel group. For real
+  sniffing use the `sniff` group below (inbox pktmon) or a companion
   such as Npcap / Wireshark alongside this tool.
 - `open-ports` touches `127.0.0.1` only (loopback self-check). Nothing here
   probes remote hosts.
@@ -311,6 +312,38 @@ normal PIN (duress sees the all-clear only).
 "alpha-9912" | node src/cli.js integrity-add C:\important\notes.txt
 "alpha-9912" | node src/cli.js integrity-verify
 ```
+
+### sniff (6)
+
+Real packet capture using inbox Windows pktmon (no third-party driver).
+Capture needs an **elevated (Administrator) terminal**; parsing a saved
+capture needs none. All commands need the normal PIN (duress sees the
+all-clear only). Captures are parsed locally (flows, DNS, ARP, HTTP auth)
+and anomalies are logged as `pcap` events, so `events` and `threat-score`
+see them too.
+
+| Command | Description |
+|---|---|
+| `sniff-check` | Show pktmon/admin readiness (no PIN needed) |
+| `sniff [--duration 30] [--pkt-size 0] [--keep]` | Capture N seconds, parse + flag anomalies |
+| `sniff-live [--interval 15] [--duration 0]` | Repeat capture windows until Ctrl+C |
+| `sniff-report` | Summary of the last capture |
+| `sniff-top [--n 10]` | Top talker flows of the last capture |
+| `sniff-dns [--n 20]` | DNS names of the last capture, suspicious flagged |
+
+```powershell
+node src/cli.js sniff-check
+"alpha-9912" | node src/cli.js sniff --duration 15
+"alpha-9912" | node src/cli.js sniff-report
+```
+
+Detection heuristics: port scans (one host, 15+ ports), SYN scans (10+
+unanswered SYNs), sweeps (20+ IPs), heavy flows, DNS tunneling (30+
+subdomains, over-long/high-entropy names, odd ports), ARP conflicts/storms,
+and cleartext HTTP credentials (values never stored). Heuristics only, not
+proof - benign causes exist (updates, CDN, VPNs). ETL/TXT files are deleted
+after parsing unless `--keep`; summaries (no payloads) stay in
+`captures.jsonl` (last 20).
 
 ## Duress PIN
 
@@ -401,7 +434,7 @@ node src/cli.js completion --uninstall  # remove the marked block
 ```
 
 Hidden `__complete <prefix...>` (never counted/listed) feeds the scripts
-with built-in (86) + enabled-plugin + alias + macro names.
+with built-in (92) + enabled-plugin + alias + macro names.
 
 ## Aliases + Macros (never counted)
 
@@ -421,7 +454,7 @@ Aliases have a recursion guard (depth 10, cycle -> clean error).
 Macros are `;`-separated: stop-on-first-error in one-shot mode, per-line
 (continue) in REPL.
 
-The 86 contract: `commands --count` stays exactly 86. Extras
+The 92 contract: `commands --count` stays exactly 92. Extras
 (plugin commands, aliases, macros, plus 9 extra built-ins) appear only in
 the footer line (`+ N plugin command(s), ...`) and are never counted.
 
@@ -429,12 +462,12 @@ the footer line (`+ N plugin command(s), ...`) and are never counted.
 
 ```text
 package.json        ESM ("type": "module"), bin { ducgo: ./src/cli.js }, no deps
-src/cli.js          hand-rolled args, hidden PIN prompt, 86 built-ins + extras (plugins/completion/alias/macro, never counted)
+src/cli.js          hand-rolled args, hidden PIN prompt, 92 built-ins + extras (plugins/completion/alias/macro, never counted)
 src/ui.js           banner/box/table/severity/ok/err/info/dim/event-format/progress (NO_COLOR aware)
 src/auth.js         PBKDF2 PIN + duress store (dataDir-injected, testable)
 src/traps.js        honey TCP / honey HTTP / canary watch / decoy deploy (stdlib only)
 src/sentinel.js     read-only network watch parsers + baselines + threat score + integrity (stdlib only, no capture)
 src/store.js        data dir: config.json (now +plugins/aliases/macros) + events.jsonl (+disabled/banners/notes) + sentinel-baseline.json + integrity.json
 examples/hello-plugin.js   example plugin (commands hello, threat-tip) used by tests
-test/selftest.js    auth + traps (ephemeral) + canary + count==86 + ui + per-command --help smoke + plugins/completion/alias/macro + sentinel/integrity
+test/selftest.js    auth + traps (ephemeral) + canary + count==92 + ui + per-command --help smoke + plugins/completion/alias/macro + sentinel/integrity
 ```

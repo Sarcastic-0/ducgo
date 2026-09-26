@@ -43,11 +43,12 @@ import {
 } from './traps.js';
 import * as ui from './ui.js';
 import * as sentinel from './sentinel.js';
+import * as sniff from './sniff.js';
 
 const VERSION = '3.0.4';
 const DURESS_MESSAGE = 'All clear - no threats detected.';
 
-// ---------- command registry (exactly 86: 70 original + 11 sentinel + 5 integrity) ----------
+// ---------- command registry (exactly 92: 70 original + 11 sentinel + 5 integrity + 6 sniff) ----------
 export const COMMANDS = [
   // auth (7)
   { name: 'setup', group: 'auth', desc: 'Set access PIN + duress PIN (interactive)', usage: 'ducgo setup' },
@@ -146,14 +147,21 @@ export const COMMANDS = [
   { name: 'integrity-verify', group: 'integrity', desc: 'Verify watched files (changed/missing) (needs PIN)', usage: 'ducgo integrity-verify' },
   { name: 'integrity-remove', group: 'integrity', desc: 'Stop watching a file (needs PIN)', usage: 'ducgo integrity-remove <file>' },
   { name: 'integrity-baseline-refresh', group: 'integrity', desc: 'Re-hash current files as new baseline (needs PIN)', usage: 'ducgo integrity-baseline-refresh' },
+  // sniff (6) - packet capture via inbox Windows pktmon (needs PIN + admin terminal)
+  { name: 'sniff-check', group: 'sniff', desc: 'Show pktmon/admin readiness (no PIN needed)', usage: 'ducgo sniff-check' },
+  { name: 'sniff', group: 'sniff', desc: 'Capture N seconds, parse + flag anomalies (needs PIN + admin)', usage: 'ducgo sniff [--duration 30] [--pkt-size 0] [--keep]' },
+  { name: 'sniff-live', group: 'sniff', desc: 'Repeat capture windows until Ctrl+C (needs PIN + admin)', usage: 'ducgo sniff-live [--interval 15] [--duration 0]' },
+  { name: 'sniff-report', group: 'sniff', desc: 'Summary of the last capture (needs PIN)', usage: 'ducgo sniff-report' },
+  { name: 'sniff-top', group: 'sniff', desc: 'Top talker flows of the last capture (needs PIN)', usage: 'ducgo sniff-top [--n 10]' },
+  { name: 'sniff-dns', group: 'sniff', desc: 'DNS names of the last capture, suspicious flagged (needs PIN)', usage: 'ducgo sniff-dns [--n 20]' },
 ];
 export const COMMAND_NAMES = COMMANDS.map((c) => c.name);
 export const COMMAND_COUNT = COMMANDS.length;
 
-// ---------- extras (NEVER counted in the 86 contract) ----------
+// ---------- extras (NEVER counted in the 92 contract) ----------
 // Built-in extras: plugin management (6) + completion + alias + macro = 9,
 // plus hidden __complete. None of these live in COMMANDS, so
-// `commands --count` stays exactly 86. They are listed only in the footer
+// `commands --count` stays exactly 92. They are listed only in the footer
 // line (`+ N plugin command(s), ...`) and via __complete/REPL completer.
 // Plugins may ONLY add commands - they may NOT hook the trap engine or auth.
 export const EXTRA_BUILTINS = [
@@ -537,7 +545,7 @@ function maybeBanner() {
 function printGroupedCommands() {
   maybeBanner();
   console.log('');
-  const groups = ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system', 'sentinel', 'integrity'];
+  const groups = ['auth', 'engine', 'traps', 'canary', 'events', 'attackers', 'reports', 'config', 'system', 'sentinel', 'integrity', 'sniff'];
   for (const g of groups) {
     console.log(ui.bold(`[${g}]`));
     for (const c of COMMANDS.filter((x) => x.group === g)) {
@@ -564,7 +572,7 @@ async function printExtrasFooter() {
       }
     }
     const extraBuiltinCount = EXTRA_BUILTIN_NAMES.length;
-    console.log(ui.dim(`+ ${pluginCmdCount} plugin command(s), ${aliasNames.length} alias(es), ${macroNames.length} macro(s), ${extraBuiltinCount} extra command(s) (extras never counted in the 86)`));
+    console.log(ui.dim(`+ ${pluginCmdCount} plugin command(s), ${aliasNames.length} alias(es), ${macroNames.length} macro(s), ${extraBuiltinCount} extra command(s) (extras never counted in the 92)`));
     if (pluginCmdCount > 0 || aliasNames.length > 0 || macroNames.length > 0) {
       ui.dim('Extras: plugin commands run with group plugin-cmd; aliases/macros expand locally. Try "ducgo help <name>".');
     }
@@ -584,7 +592,7 @@ function printHelp() {
   console.log('  ducgo events             Review recorded touches');
   console.log('  ducgo attackers          Group touches by IP');
   console.log('');
-  console.log(ui.bold('Groups: auth(7) engine(4) traps(9) canary(6) events(7) attackers(5) reports(4) config(8) system(20) sentinel(11) integrity(5) = 86'));
+  console.log(ui.bold('Groups: auth(7) engine(4) traps(9) canary(6) events(7) attackers(5) reports(4) config(8) system(20) sentinel(11) integrity(5) sniff(6) = 92'));
   console.log('Run "ducgo commands" for the full grouped list, "ducgo help <command>" for details.');
   console.log('');
   console.log(ui.dim('Duress: entering the duress PIN at any PIN prompt shows a fake all-clear and records a silent alert.'));
@@ -605,7 +613,7 @@ function cmdUsage(name) {
   if (ex) {
     maybeBanner();
     console.log('');
-    console.log(ui.bold(`ducgo ${ex.name}`) + ` - ${ex.desc} [extra, never counted in the 86]`);
+    console.log(ui.bold(`ducgo ${ex.name}`) + ` - ${ex.desc} [extra, never counted in the 92]`);
     console.log(`Usage: ${ex.usage}`);
     return;
   }
@@ -2451,11 +2459,227 @@ async function cmdIntegrityBaselineRefresh(rest) {
   ui.ok(`Baseline refreshed: ${r.refreshed}/${r.total} file(s).${r.gone.length > 0 ? ` Missing: ${r.gone.join(', ')}` : ''}`);
 }
 
-// Command dispatch table (exactly 86 entries). Shared by one-shot mode and
+// ================= SNIFF (packet capture via inbox Windows pktmon) =================
+// Captures YOUR OWN machine's traffic with pktmon (no third-party driver),
+// converts with etl2txt, parses + analyzes locally. Capture needs an elevated
+// (Administrator) terminal; parsing a saved capture needs none. All commands
+// need the normal PIN; the duress PIN sees the all-clear only (via requireAuth).
+function sniffAdminOrFail() {
+  if (!sniff.pktmonExe()) fail('PktMon.exe not found (needs Windows 10 1809+ / 11).');
+  if (!sniff.isAdmin()) fail('Packet capture needs an elevated terminal. Re-open PowerShell as Administrator, then retry. (Parsing a saved capture needs no elevation.)');
+}
+function sniffPrintAnomalies(anomalies) {
+  if (anomalies.length === 0) { ui.ok('no anomalies in this window.'); return; }
+  for (const a of anomalies) {
+    const line = `${a.title}: ${a.detail}`;
+    if (a.severity === 'high') ui.err(line);
+    else ui.warn(line);
+  }
+}
+function sniffLogAnomalies(dataDir, anomalies, windowLabel) {
+  let n = 0;
+  for (const a of anomalies) {
+    if (a.severity !== 'high' && a.severity !== 'medium') continue;
+    try {
+      appendEvent(dataDir, makeEvent('pcap', 'sniff', '127.0.0.1', `${windowLabel}: ${a.title} - ${a.detail}`.slice(0, 400), a.severity, { source: 'pktmon' }));
+      n++;
+    } catch { /* best effort */ }
+  }
+  return n;
+}
+function sniffPrintSummary(s) {
+  console.log(ui.box('sniff', [
+    `packets: ${s.packets} (tcp ${s.tcp} / udp ${s.udp}, rx ${s.rx} / tx ${s.tx})`,
+    `flows: ${s.flows} | external contacts: ${s.extContacts} | dns: ${s.dnsQueries} queries (${s.dnsNames} names)`,
+    `anomalies: ${s.anomalies.length} (high ${s.highs} / medium ${s.mediums}) in ${s.seconds}s`,
+  ]));
+  if (s.topFlows.length > 0) {
+    console.log(ui.table(['FLOW', 'PACKETS', 'BYTES'], s.topFlows.slice(0, 10).map((f) => [f.key, String(f.packets), String(f.bytes)])));
+  }
+  sniffPrintAnomalies(s.anomalies);
+}
+async function cmdSniffCheck(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sniff-check');
+  const st = sniff.driverStatus();
+  console.log(ui.box('sniff-check', [
+    'capture: Windows pktmon (inbox, no extra driver)',
+    'parse: local etl2txt text analysis (flows, DNS, ARP, HTTP auth)',
+    'admin: required for capture only - parsing needs none',
+  ]));
+  console.log(ui.table(['CHECK', 'RESULT'], [
+    ['pktmon', st.present ? `PASS (${sniff.pktmonExe()})` : `FAIL (${st.detail})`],
+    ['admin terminal', st.admin ? 'PASS (elevated)' : 'NOT ELEVATED (capture needs Administrator)'],
+    ['driver', st.present && st.admin ? `PASS (${st.detail})` : 'UNKNOWN (re-run elevated to probe)'],
+  ]));
+}
+async function cmdSniff(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sniff');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  sniffAdminOrFail();
+  const duRaw = takeFlagValue(rest, ['--duration']);
+  let seconds = 30;
+  if (duRaw !== null) {
+    const n = Number(String(duRaw).trim());
+    if (!Number.isInteger(n) || n < 3 || n > 300) fail('--duration must be 3-300 seconds');
+    seconds = n;
+  }
+  const psRaw = takeFlagValue(rest, ['--pkt-size']);
+  let pktSize = 0;
+  if (psRaw !== null) {
+    const n = Number(String(psRaw).trim());
+    if (!Number.isInteger(n) || !((n === 0) || (n >= 64 && n <= 9000))) fail('--pkt-size must be 0 (full) or 64-9000');
+    pktSize = n;
+  }
+  const keep = hasFlag(rest, ['--keep']);
+  fs.mkdirSync(sniff.capturesDir(dataDir), { recursive: true });
+  const etlPath = path.join(sniff.capturesDir(dataDir), `cap-${Date.now().toString(36)}.etl`);
+  ui.info(`Capturing ${seconds}s with pktmon (pkt-size ${pktSize === 0 ? 'full' : pktSize})...`);
+  const cap = await sniff.captureWindow({ etlPath, seconds, pktSize });
+  if (!cap.ok) fail(`Capture failed: ${cap.error}`);
+  let text = '';
+  try { text = sniff.readEtlText(cap.txtPath); } catch { fail('Could not read converted capture.'); }
+  const summary = sniff.summarizeCapture(sniff.parseEtlText(text), { seconds, etlPath, kept: keep });
+  sniff.saveCaptureSummary(dataDir, summary);
+  if (!keep) {
+    try { fs.rmSync(etlPath, { force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(cap.txtPath, { force: true }); } catch { /* ignore */ }
+  } else {
+    ui.info(`Kept: ${etlPath}`);
+  }
+  sniffPrintSummary(summary);
+  const logged = sniffLogAnomalies(dataDir, summary.anomalies, `sniff ${seconds}s`);
+  ui.info(`Anomaly events logged: ${logged}. Full list: "ducgo events". Details: "ducgo sniff-report".`);
+}
+async function cmdSniffLive(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sniff-live');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  sniffAdminOrFail();
+  const ivRaw = takeFlagValue(rest, ['--interval']);
+  let intervalSec = 15;
+  if (ivRaw !== null) {
+    const n = Number(String(ivRaw).trim());
+    if (!Number.isInteger(n) || n < 5 || n > 300) fail('--interval must be 5-300 seconds');
+    intervalSec = n;
+  }
+  const duRaw = takeFlagValue(rest, ['--duration']);
+  let durationSec = 0;
+  if (duRaw !== null) {
+    const n = Number(String(duRaw).trim());
+    if (!Number.isInteger(n) || n < 0 || n > 3600) fail('--duration must be 0-3600 seconds (0 = until Ctrl+C)');
+    durationSec = n;
+  }
+  fs.mkdirSync(sniff.capturesDir(dataDir), { recursive: true });
+  ui.info(`Sniff-live: ${intervalSec}s windows${durationSec > 0 ? ` for ${durationSec}s` : ' until Ctrl+C'} (pktmon capture per window).`);
+  const startedAt = Date.now();
+  let cycle = 0;
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  if (!replActive) {
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  }
+  if (replActive && replRl) {
+    const rl = replRl;
+    if (!rl.closed) {
+      await new Promise((resolve) => {
+        const done = () => {
+          replStopResolver = null;
+          try { rl.removeListener('close', done); } catch { /* ignore */ }
+          stop();
+          resolve();
+        };
+        replStopResolver = done;
+        try { rl.once('close', done); } catch { /* ignore */ }
+      });
+    }
+    replStopResolver = null;
+  }
+  while (!stopped) {
+    cycle++;
+    const etlPath = path.join(sniff.capturesDir(dataDir), `live-${Date.now().toString(36)}.etl`);
+    const cap = await sniff.captureWindow({ etlPath, seconds: intervalSec, pktSize: 0 });
+    if (!cap.ok) {
+      ui.warn(`window ${cycle}: capture failed (${cap.error})`);
+    } else {
+      let text = '';
+      try { text = sniff.readEtlText(cap.txtPath); } catch { text = ''; }
+      const summary = sniff.summarizeCapture(sniff.parseEtlText(text), { seconds: intervalSec, etlPath, kept: false });
+      sniff.saveCaptureSummary(dataDir, summary);
+      if (summary.anomalies.length === 0) {
+        ui.ok(`[${cycle}] clean (${summary.packets} packets)`);
+      } else {
+        for (const a of summary.anomalies.slice(0, 5)) {
+          if (a.severity === 'high') ui.err(`[${cycle}] ${a.title}: ${a.detail}`);
+          else ui.warn(`[${cycle}] ${a.title}: ${a.detail}`);
+        }
+        sniffLogAnomalies(dataDir, summary.anomalies, `sniff-live window ${cycle}`);
+      }
+      try { fs.rmSync(cap.txtPath, { force: true }); } catch { /* ignore */ }
+    }
+    try { fs.rmSync(etlPath, { force: true }); } catch { /* ignore */ }
+    const elapsed = (Date.now() - startedAt) / 1000;
+    if (durationSec > 0 && elapsed >= durationSec) break;
+    if (stopped) break;
+  }
+  console.log(ui.dim('Sniff-live stopped cleanly.'));
+}
+function sniffNeedSummary(dataDir) {
+  const s = sniff.readLastCapture(dataDir);
+  if (!s) fail('No captures yet. Run "ducgo sniff --duration 15" first.');
+  return s;
+}
+async function cmdSniffReport(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sniff-report');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const s = sniffNeedSummary(dataDir);
+  ui.info(`Last capture: ${s.id} at ${s.time} (${s.seconds}s window).`);
+  sniffPrintSummary(s);
+}
+async function cmdSniffTop(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sniff-top');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const s = sniffNeedSummary(dataDir);
+  let n = 10;
+  const nRaw = takeFlagValue(rest, ['--n']);
+  if (nRaw !== null) {
+    const v = Number(String(nRaw).trim());
+    if (!Number.isInteger(v) || v < 1 || v > 50) fail('--n must be 1-50');
+    n = v;
+  }
+  if (s.topFlows.length === 0) { ui.dim('No flows in the last capture.'); return; }
+  console.log(ui.table(['FLOW', 'PACKETS', 'BYTES'], s.topFlows.slice(0, n).map((f) => [f.key, String(f.packets), String(f.bytes)])));
+}
+async function cmdSniffDns(rest) {
+  if (wantsHelp(rest)) return cmdUsage('sniff-dns');
+  const dataDir = getDataDir();
+  await requireAuth(dataDir);
+  const s = sniffNeedSummary(dataDir);
+  let n = 20;
+  const nRaw = takeFlagValue(rest, ['--n']);
+  if (nRaw !== null) {
+    const v = Number(String(nRaw).trim());
+    if (!Number.isInteger(v) || v < 1 || v > 100) fail('--n must be 1-100');
+    n = v;
+  }
+  if (!s.dnsTop || s.dnsTop.length === 0) { ui.dim('No DNS queries in the last capture.'); return; }
+  const rows = s.dnsTop.slice(0, n).map((d) => {
+    const oddPort = (d.ports || []).some((p) => p !== 53);
+    const longName = String(d.name).replace(/\.$/, '').length > 60;
+    return [d.name, String(d.count), (d.qtypes || []).join(','), (d.ports || []).join(','), oddPort || longName ? '!' : ''];
+  });
+  console.log(ui.table(['NAME', 'COUNT', 'QTYPES', 'PORTS', 'FLAG'], rows));
+  ui.dim('FLAG ! = odd port or over-long name (possible tunneling - investigate).');
+}
+
+// Command dispatch table (exactly 92 entries). Shared by one-shot mode and
 // the interactive REPL so both modes run the SAME handler path.
 // NOTE: extras (plugin mgmt, completion, alias, macro, __complete) plus
-// plugin/alias/macro expansions live OUTSIDE this table so the 86 contract
-// (`commands --count` -> 86) never breaks. See EXTRA_HANDLERS + dispatchTokens.
+// plugin/alias/macro expansions live OUTSIDE this table so the 92 contract
+// (`commands --count` -> 92) never breaks. See EXTRA_HANDLERS + dispatchTokens.
 const HANDLERS = {
   setup: cmdSetup, 'login-test': cmdLoginTest, 'change-pin': cmdChangePin, 'change-duress': cmdChangeDuress,
   'lock-status': cmdLockStatus, 'auth-status': cmdAuthStatus, 'reset-all': cmdResetAll,
@@ -2481,14 +2705,16 @@ const HANDLERS = {
   'dns-check': cmdDnsCheck, 'threat-score': cmdThreatScore,
   'integrity-add': cmdIntegrityAdd, 'integrity-list': cmdIntegrityList, 'integrity-verify': cmdIntegrityVerify,
   'integrity-remove': cmdIntegrityRemove, 'integrity-baseline-refresh': cmdIntegrityBaselineRefresh,
+  'sniff-check': cmdSniffCheck, sniff: cmdSniff, 'sniff-live': cmdSniffLive,
+  'sniff-report': cmdSniffReport, 'sniff-top': cmdSniffTop, 'sniff-dns': cmdSniffDns,
 };
-// Extra dispatch table (NEVER counted in the 86). 9 visible extras + 1 hidden.
+// Extra dispatch table (NEVER counted in the 92). 9 visible extras + 1 hidden.
 const EXTRA_HANDLERS = {
   'plugin-add': cmdPluginAdd, 'plugin-enable': cmdPluginEnable, 'plugin-disable': cmdPluginDisable,
   'plugin-list': cmdPluginList, 'plugin-show': cmdPluginShow, 'plugin-remove': cmdPluginRemove,
   completion: cmdCompletion, alias: cmdAlias, macro: cmdMacro, '__complete': cmdCompleteHidden,
 };
-// Unified dispatch: built-ins (86) -> extras -> enabled plugin commands ->
+// Unified dispatch: built-ins (92) -> extras -> enabled plugin commands ->
 // aliases (with depth-10/cycle guard) -> macros (direct name runs macro).
 // Throws/calls process.exit(1) on unknown (one-shot) or per-line error (REPL).
 async function dispatchTokens(cmd, rest) {
@@ -2548,7 +2774,7 @@ async function dispatchTokens(cmd, rest) {
 // Bare `ducgo` (no arguments) enters a persistent REPL instead of printing
 // help-and-exit. Every line is parsed quote-aware and dispatched through the
 // SAME handlers as one-shot mode, so behavior (incl. auth/duress) is identical.
-// The registry stays exactly 86 built-ins; extras (plugins/aliases/macros +
+// The registry stays exactly 92 built-ins; extras (plugins/aliases/macros +
 // plugin-mgmt/completion) ride dispatchTokens + footer and are never counted.
 export function splitReplLine(line) {
   const out = [];
@@ -2620,7 +2846,7 @@ function appendReplHistory(historyFile, line) {
   } catch { /* history is best-effort; never break the shell */ }
 }
 // One REPL line, dispatched through the SAME handlers as one-shot mode.
-// Covers built-ins (86) + extras + enabled plugin commands + aliases/macros.
+// Covers built-ins (92) + extras + enabled plugin commands + aliases/macros.
 // `help <name>` shows origin/expansion for plugin/alias/macro. Returns 'quit'
 // when the shell should close, 'more' otherwise.
 async function replHandleLine(rawLine, ctx) {
