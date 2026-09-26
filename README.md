@@ -8,7 +8,7 @@ is logged as an event with the visitor's fingerprint. Includes duress-PIN mode
 
 > 100% passive/defensive. Zero offensive traffic - the tool only listens on
 > ports, serves a fake login page, watches files, and reads local OS tables
-> (netstat, arp, netsh, tasklist) plus a loopback-only self-scan. It never
+> (netstat/ss, arp/ip-neigh, netsh/nmcli/airport, tasklist) plus a loopback-only self-scan. It never
 > probes remote hosts, never captures packets, and never attacks anything.
 
 English only (output). CLI only. **Zero runtime dependencies** (Node.js standard
@@ -31,23 +31,32 @@ ducgo v3.0.4
 
 ## Install
 
-Requires Node.js 18+.
+Requires Node.js 18+. Same 92 commands on Windows, Linux, and macOS
+(see `docs/INSTALL.md` for per-OS prerequisites).
 
 ```powershell
 cd "C:\Users\LORD laptop\Documents\MirageNet"
 node src/cli.js --help
 ```
 
-The bin is `ducgo` (`./src/cli.js`, shebang kept). Do NOT `npm link` - running
-`node src/cli.js` is sufficient.
+The bin is `ducgo` (`./src/cli.js`, shebang kept). Running
+`node src/cli.js` is sufficient; optionally `npm link` puts `ducgo` on
+PATH (`npm unlink` removes it). Per-OS notes: Windows needs nothing beyond
+Node (inbox `netstat`/`arp`/`netsh`/`tasklist`/`PktMon.exe`, admin terminal
+for capture); Linux needs `iproute2` (`ss`/`ip`) + `tcpdump` + `sudo` for
+capture; macOS ships `tcpdump` (still needs `sudo` for capture).
+`ducgo doctor` / `ducgo sysinfo` / `ducgo sniff-check` show the detected
+platform + backend on every OS.
 
 Set `NO_COLOR=1` to disable ANSI colors (plain logo; tagline + version still shown).
 
 ## Data
 
-Data dir stays `%USERPROFILE%\.miragenet\` (`auth.json`, `events.jsonl`,
-`config.json`, `sentinel-baseline.json`, `integrity.json`). Set `MIRAGENET_DIR` to override the data directory (used for
-testing so you never touch the real store).
+Data dir is `~/.miragenet` on every OS (Windows: `%USERPROFILE%\.miragenet`;
+Linux/macOS: `~/.miragenet`) holding `auth.json`, `events.jsonl`,
+`config.json`, `sentinel-baseline.json`, `integrity.json`. Set `MIRAGENET_DIR` to override the data directory (used for
+testing so you never touch the real store). Hosts file per OS:
+Windows `%SystemRoot%\System32\drivers\etc\hosts`, Linux/macOS `/etc/hosts`.
 
 ## Quick start
 
@@ -281,16 +290,23 @@ All commands need the normal PIN (duress sees the all-clear only).
 
 Honest sentinel notes (read before trusting alerts):
 
+- Per-OS backends (same commands, same output shapes): Windows
+  `netstat -ano` + `tasklist` / `arp -a` / `netsh wlan`; Linux `ss -tunp`
+  (fallback legacy `netstat`) / `ip neigh` (fallback `arp -a`) /
+  `nmcli dev wifi` (fallback `iwlist scan`); macOS `netstat -anv -p tcp/udp`
+  (no PID column - PIDs shown as 0) / `arp -a` (BSD format) / `airport -s`.
+  Missing tools degrade to `not available on <os>: <what to install>` -
+  never a crash. Full matrix: `docs/INSTALL.md`.
 - Heuristics only, not proof. New listeners, ARP changes, new BSSIDs, DNS
   rotations, and hosts edits all have benign causes (updates, DHCP, mesh /
   repeaters, CDN rotation, VPNs). Confirm unknown MACs / BSSIDs against your
   router admin page before acting.
 - No packet capture is used or claimed by the sentinel group. For real
-  sniffing use the `sniff` group below (inbox pktmon) or a companion
-  such as Npcap / Wireshark alongside this tool.
+  sniffing use the `sniff` group below (pktmon on Windows, tcpdump/dumpcap
+  on Linux/macOS) or a companion such as Npcap / Wireshark alongside this tool.
 - `open-ports` touches `127.0.0.1` only (loopback self-check). Nothing here
   probes remote hosts.
-- `wifi-scan` needs Windows + a WLAN adapter; on other setups it reports
+- `wifi-scan` needs a WLAN adapter; on other setups it reports
   cleanly and the parsers remain unit-tested with fixtures.
 - First `listen` / `sentinel-check` run with no baseline auto-creates one and
   says so - re-run to get diffs.
@@ -315,10 +331,11 @@ normal PIN (duress sees the all-clear only).
 
 ### sniff (6)
 
-Real packet capture using inbox Windows pktmon (no third-party driver).
-Capture needs an **elevated (Administrator) terminal**; parsing a saved
-capture needs none. All commands need the normal PIN (duress sees the
-all-clear only). Captures are parsed locally (flows, DNS, ARP, HTTP auth)
+Real packet capture with per-OS backends: inbox Windows pktmon (no
+third-party driver), Linux `tcpdump` or `dumpcap`, macOS system `tcpdump`.
+Capture needs privilege - an **elevated (Administrator) terminal** on
+Windows, `sudo`/root on Linux/macOS; parsing a saved capture needs none.
+All commands need the normal PIN (duress sees the all-clear only). Captures are parsed locally (flows, DNS, ARP, HTTP auth)
 and anomalies are logged as `pcap` events, so `events` and `threat-score`
 see them too.
 
@@ -341,9 +358,11 @@ Detection heuristics: port scans (one host, 15+ ports), SYN scans (10+
 unanswered SYNs), sweeps (20+ IPs), heavy flows, DNS tunneling (30+
 subdomains, over-long/high-entropy names, odd ports), ARP conflicts/storms,
 and cleartext HTTP credentials (values never stored). Heuristics only, not
-proof - benign causes exist (updates, CDN, VPNs). ETL/TXT files are deleted
-after parsing unless `--keep`; summaries (no payloads) stay in
-`captures.jsonl` (last 20).
+proof - benign causes exist (updates, CDN, VPNs). ETL/TXT (Windows) or pcap
+(Linux/macOS) files are deleted after parsing unless `--keep`; summaries (no payloads) stay in
+`captures.jsonl` (last 20). Linux/macOS parse `tcpdump -n -l -v` text
+in-memory (no intermediate text file); only the default interface is
+captured, loopback-only traffic is out of scope.
 
 ## Duress PIN
 
@@ -466,8 +485,12 @@ src/cli.js          hand-rolled args, hidden PIN prompt, 92 built-ins + extras (
 src/ui.js           banner/box/table/severity/ok/err/info/dim/event-format/progress (NO_COLOR aware)
 src/auth.js         PBKDF2 PIN + duress store (dataDir-injected, testable)
 src/traps.js        honey TCP / honey HTTP / canary watch / decoy deploy (stdlib only)
-src/sentinel.js     read-only network watch parsers + baselines + threat score + integrity (stdlib only, no capture)
+src/platform.js     windows/linux/darwin mapping + isAdmin/hostsPath/dataDir/hasCmd (stdlib only)
+src/sentinel.js     read-only network watch parsers + baselines + threat score + integrity (stdlib only, no capture; per-OS backends)
+src/sniff.js        per-OS capture (pktmon/tcpdump/dumpcap) + shared local parser + analyzer (stdlib only)
 src/store.js        data dir: config.json (now +plugins/aliases/macros) + events.jsonl (+disabled/banners/notes) + sentinel-baseline.json + integrity.json
+docs/INSTALL.md     per-OS prerequisites, npm link/unlink, data locations, executed-vs-fixture-tested matrix
 examples/hello-plugin.js   example plugin (commands hello, threat-tip) used by tests
 test/selftest.js    auth + traps (ephemeral) + canary + count==92 + ui + per-command --help smoke + plugins/completion/alias/macro + sentinel/integrity
+test/crossplatform.js   platform unit tests (injected os strings, no global patching) + linux/macOS parser fixtures + tcpdump analyzer reuse + count==92 smoke
 ```

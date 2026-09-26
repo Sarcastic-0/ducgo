@@ -44,6 +44,7 @@ import {
 import * as ui from './ui.js';
 import * as sentinel from './sentinel.js';
 import * as sniff from './sniff.js';
+import { platform as detectPlatform, isAdmin as platformIsAdmin, hostsPath as platformHostsPath } from './platform.js';
 
 const VERSION = '3.0.4';
 const DURESS_MESSAGE = 'All clear - no threats detected.';
@@ -596,7 +597,7 @@ function printHelp() {
   console.log('Run "ducgo commands" for the full grouped list, "ducgo help <command>" for details.');
   console.log('');
   console.log(ui.dim('Duress: entering the duress PIN at any PIN prompt shows a fake all-clear and records a silent alert.'));
-  console.log(ui.dim('Data: %USERPROFILE%\\.miragenet\\ (auth.json, events.jsonl, config.json). MIRAGENET_DIR overrides it.'));
+  console.log(ui.dim('Data: ~/.miragenet (Windows: %USERPROFILE%\\.miragenet; Linux/macOS: ~/.miragenet). MIRAGENET_DIR overrides it.'));
   console.log(ui.dim('Engine runs foreground only - press Ctrl+C to stop. No daemon/background mode.'));
   console.log(ui.dim('Colors: set NO_COLOR=1 to disable ANSI colors. Exit codes: 0 ok, 1 error.'));
 }
@@ -1496,7 +1497,7 @@ async function cmdConfigReset(rest) {
 async function cmdDataDir(rest) {
   if (wantsHelp(rest)) return cmdUsage('data-dir');
   console.log(getDataDir());
-  ui.dim('Data dir stays %USERPROFILE%\\.miragenet unless MIRAGENET_DIR is set.');
+  ui.dim('Default is ~/.miragenet (Windows: %USERPROFILE%\\.miragenet) unless MIRAGENET_DIR is set.');
 }
 async function cmdDataSize(rest) {
   if (wantsHelp(rest)) return cmdUsage('data-size');
@@ -1998,6 +1999,11 @@ async function cmdDoctor(rest) {
   const dataDir = getDataDir();
   const checks = [];
   checks.push(['node >= 18', Number(process.versions.node.split('.')[0]) >= 18 ? 'PASS' : `FAIL (${process.version})`]);
+  checks.push(['platform', `${detectPlatform()} (${os.platform()} ${os.arch()}, ${os.release()})`]);
+  checks.push(['hosts file', platformHostsPath()]);
+  const be = sniff.captureBackend();
+  checks.push(['capture backend', be.available ? `PASS (${be.kind}${be.exe ? ` @ ${be.exe}` : ''})` : `MISSING - ${be.installHint}`]);
+  checks.push(['capture privilege', sniff.isAdmin() ? 'YES (elevated/root)' : 'no (capture needs elevation: Administrator on Windows, sudo on Linux/macOS)']);
   try { ensureDataDir(dataDir); fs.accessSync(dataDir, fs.constants.W_OK); checks.push(['data dir writable', `PASS (${dataDir})`]); }
   catch (e) { checks.push(['data dir writable', `FAIL (${e.message})`]); }
   checks.push(['auth setup', isSetup(dataDir) ? 'PASS' : 'NOT SET UP (run ducgo setup)']);
@@ -2076,7 +2082,19 @@ async function cmdLogPath(rest) {
 }
 async function cmdSysinfo(rest) {
   if (wantsHelp(rest)) return cmdUsage('sysinfo');
-  console.log(ui.table(['KEY', 'VALUE'], [['node', process.version], ['platform', `${os.platform()} ${os.arch()}`], ['release', os.release()], ['ducgo', `v${VERSION}`]]));
+  const be = sniff.captureBackend();
+  console.log(ui.table(['KEY', 'VALUE'], [
+    ['node', process.version],
+    ['platform', `${os.platform()} ${os.arch()}`],
+    ['family', detectPlatform()],
+    ['release', os.release()],
+    ['hosts', platformHostsPath()],
+    ['data dir', getDataDir()],
+    ['capture backend', be.available ? `${be.kind}${be.exe ? ` (${be.exe})` : ''}` : be.installHint],
+    ['capture privilege', sniff.isAdmin() ? 'elevated/root' : 'not elevated (needs Administrator on Windows, sudo on Linux/macOS)'],
+    ['collectors', sentinel.describeCollectors().map((r) => r.join(': ')).join(' | ')],
+    ['ducgo', `v${VERSION}`],
+  ]));
 }
 async function cmdUptime(rest) {
   if (wantsHelp(rest)) return cmdUsage('uptime');
@@ -2137,13 +2155,17 @@ async function cmdSupport(rest) {
 }
 
 // ================= SENTINEL (proactive, honest, stdlib-only) =================
-// Read-only Windows queries with timeouts. No packet capture: real sniffing
-// needs a companion such as Npcap / Wireshark (see README). Every spawned OS
-// command is killed after 8s with a clean error. Only the tool data dir is
+// Read-only per-OS table queries with timeouts (Windows netstat/arp/netsh,
+// Linux ss/ip/nmcli, macOS netstat/arp/airport). No packet capture: real
+// sniffing lives in the sniff group (see README + docs/INSTALL.md). Every
+// spawned OS command is killed after 8s with a clean error. Only the tool data dir is
 // ever written (baselines + sentinel events). All commands need the normal
 // PIN; the duress PIN sees the all-clear only (via requireAuth).
 function sentinelOsNote() {
-  console.log(ui.dim('Read-only OS queries (netstat, arp, netsh, tasklist) + loopback self-scan only. No remote probing, no capture.'));
+  const plat = detectPlatform();
+  if (plat === 'linux') console.log(ui.dim('Read-only OS queries (ss, ip neigh, nmcli/iwlist) + loopback self-scan only. No remote probing, no capture.'));
+  else if (plat === 'darwin') console.log(ui.dim('Read-only OS queries (netstat -anv, arp -a, airport -s) + loopback self-scan only. No remote probing, no capture.'));
+  else console.log(ui.dim('Read-only OS queries (netstat, arp, netsh, tasklist) + loopback self-scan only. No remote probing, no capture.'));
 }
 async function cmdListen(rest) {
   if (wantsHelp(rest)) return cmdUsage('listen');
@@ -2275,7 +2297,7 @@ async function cmdOpenPorts(rest) {
   if (wantsHelp(rest)) return cmdUsage('open-ports');
   const dataDir = getDataDir();
   await requireAuth(dataDir);
-  ui.info('Self-scan of 127.0.0.1 common ports (short timeout) + local listeners from netstat.');
+  ui.info(`Self-scan of 127.0.0.1 common ports (short timeout) + local listeners via ${detectPlatform() === 'linux' ? 'ss (fallback netstat)' : detectPlatform() === 'darwin' ? 'netstat -anv' : 'netstat'}.`);
   const [open, ns] = await Promise.all([
     sentinel.scanLoopbackPorts('127.0.0.1', sentinel.COMMON_PORTS, 350),
     Promise.resolve(sentinel.getNetstatSnapshot()),
@@ -2459,14 +2481,25 @@ async function cmdIntegrityBaselineRefresh(rest) {
   ui.ok(`Baseline refreshed: ${r.refreshed}/${r.total} file(s).${r.gone.length > 0 ? ` Missing: ${r.gone.join(', ')}` : ''}`);
 }
 
-// ================= SNIFF (packet capture via inbox Windows pktmon) =================
-// Captures YOUR OWN machine's traffic with pktmon (no third-party driver),
-// converts with etl2txt, parses + analyzes locally. Capture needs an elevated
-// (Administrator) terminal; parsing a saved capture needs none. All commands
-// need the normal PIN; the duress PIN sees the all-clear only (via requireAuth).
+// ================= SNIFF (per-OS packet capture, shared local analysis) =================
+// Captures YOUR OWN machine's traffic - Windows pktmon (inbox, ETL+etl2txt),
+// Linux tcpdump|dumpcap, macOS system tcpdump (pcap + in-memory text parse) -
+// then parses + analyzes locally. Capture needs privilege (Administrator on
+// Windows, sudo/root on Linux/macOS); parsing a saved capture needs none.
+// All commands need the normal PIN; the duress PIN sees the all-clear only
+// (via requireAuth).
 function sniffAdminOrFail() {
-  if (!sniff.pktmonExe()) fail('PktMon.exe not found (needs Windows 10 1809+ / 11).');
-  if (!sniff.isAdmin()) fail('Packet capture needs an elevated terminal. Re-open PowerShell as Administrator, then retry. (Parsing a saved capture needs no elevation.)');
+  const plat = detectPlatform();
+  if (plat === 'windows') {
+    if (!sniff.pktmonExe()) fail('PktMon.exe not found (needs Windows 10 1809+ / 11).');
+    if (!sniff.isAdmin()) fail('Packet capture needs an elevated terminal. Re-open PowerShell as Administrator, then retry. (Parsing a saved capture needs no elevation.)');
+    return;
+  }
+  const be = sniff.captureBackend(plat);
+  if (!be.available) fail(`No capture tool on PATH (${be.installHint}).`);
+  // Names Administrator too so the guidance stays greppable on every OS;
+  // the POSIX path itself is sudo.
+  if (!sniff.isAdmin()) fail('Packet capture needs root (Administrator-equivalent). Re-run with sudo, e.g. sudo node src/cli.js sniff --duration 15. (Parsing a saved capture needs no elevation.)');
 }
 function sniffPrintAnomalies(anomalies) {
   if (anomalies.length === 0) { ui.ok('no anomalies in this window.'); return; }
@@ -2500,16 +2533,21 @@ function sniffPrintSummary(s) {
 }
 async function cmdSniffCheck(rest) {
   if (wantsHelp(rest)) return cmdUsage('sniff-check');
+  const plat = detectPlatform();
   const st = sniff.driverStatus();
+  const be = sniff.captureBackend();
   console.log(ui.box('sniff-check', [
-    'capture: Windows pktmon (inbox, no extra driver)',
-    'parse: local etl2txt text analysis (flows, DNS, ARP, HTTP auth)',
-    'admin: required for capture only - parsing needs none',
+    `platform: ${plat} (${os.platform()} ${os.arch()})`,
+    'capture: Windows pktmon (inbox) / Linux tcpdump|dumpcap / macOS tcpdump (system)',
+    'parse: local text analysis (flows, DNS, ARP, HTTP auth) on every OS',
+    'privilege: required for capture only (Administrator on Windows, sudo/root on Linux/macOS) - parsing needs none',
+    `active backend: ${be.kind}${be.exe ? ` (${be.exe})` : ''} - ${st.detail}`,
   ]));
   console.log(ui.table(['CHECK', 'RESULT'], [
-    ['pktmon', st.present ? `PASS (${sniff.pktmonExe()})` : `FAIL (${st.detail})`],
-    ['admin terminal', st.admin ? 'PASS (elevated)' : 'NOT ELEVATED (capture needs Administrator)'],
-    ['driver', st.present && st.admin ? `PASS (${st.detail})` : 'UNKNOWN (re-run elevated to probe)'],
+    ['platform/backend', `${plat} / ${be.kind}`],
+    [plat === 'windows' ? 'pktmon' : 'capture tool', be.available ? `PASS (${be.exe || be.kind})` : `FAIL (${be.installHint})`],
+    ['privilege', st.admin ? 'PASS (elevated/root)' : 'NOT ELEVATED (Windows: Administrator terminal; Linux/macOS: sudo)'],
+    ['driver', be.available && st.admin ? `PASS (${st.detail})` : 'UNKNOWN (resolve the rows above, then re-run)'],
   ]));
 }
 async function cmdSniff(rest) {
@@ -2532,6 +2570,7 @@ async function cmdSniff(rest) {
     pktSize = n;
   }
   const keep = hasFlag(rest, ['--keep']);
+  if (detectPlatform() !== 'windows') return cmdSniffPosix(dataDir, { seconds, pktSize, keep });
   fs.mkdirSync(sniff.capturesDir(dataDir), { recursive: true });
   const etlPath = path.join(sniff.capturesDir(dataDir), `cap-${Date.now().toString(36)}.etl`);
   ui.info(`Capturing ${seconds}s with pktmon (pkt-size ${pktSize === 0 ? 'full' : pktSize})...`);
@@ -2546,6 +2585,31 @@ async function cmdSniff(rest) {
     try { fs.rmSync(cap.txtPath, { force: true }); } catch { /* ignore */ }
   } else {
     ui.info(`Kept: ${etlPath}`);
+  }
+  sniffPrintSummary(summary);
+  const logged = sniffLogAnomalies(dataDir, summary.anomalies, `sniff ${seconds}s`);
+  ui.info(`Anomaly events logged: ${logged}. Full list: "ducgo events". Details: "ducgo sniff-report".`);
+}
+// POSIX sniff: pcap via tcpdump/dumpcap, text via `tcpdump -n -l -v -r`
+// parsed in-memory through the shared parser/analyzer. Pcap files are
+// deleted after parsing unless --keep (summaries, no payloads, stay in
+// captures.jsonl like on Windows).
+async function cmdSniffPosix(dataDir, { seconds, pktSize, keep }) {
+  const plat = detectPlatform();
+  const be = sniff.captureBackend(plat);
+  fs.mkdirSync(sniff.capturesDir(dataDir), { recursive: true });
+  const pcapPath = path.join(sniff.capturesDir(dataDir), `cap-${Date.now().toString(36)}.pcap`);
+  ui.info(`Capturing ${seconds}s with ${be.kind} on ${plat} (snaplen ${pktSize === 0 ? 'full' : pktSize}; default interface - loopback-only traffic is out of scope)...`);
+  const cap = await sniff.capturePcapWindow({ pcapPath, seconds, snaplen: pktSize });
+  if (!cap.ok) fail(`Capture failed: ${cap.error}`);
+  const rd = sniff.readPcapText(pcapPath);
+  if (!rd.ok) fail(`Could not read capture: ${rd.error}`);
+  const summary = sniff.summarizeCapture(sniff.parseEtlText(rd.text), { seconds, etlPath: keep ? pcapPath : '', kept: keep });
+  sniff.saveCaptureSummary(dataDir, summary);
+  if (!keep) {
+    try { fs.rmSync(pcapPath, { force: true }); } catch { /* ignore */ }
+  } else {
+    ui.info(`Kept: ${pcapPath}`);
   }
   sniffPrintSummary(summary);
   const logged = sniffLogAnomalies(dataDir, summary.anomalies, `sniff ${seconds}s`);
@@ -2573,6 +2637,7 @@ async function cmdSniffLive(rest) {
   fs.mkdirSync(sniff.capturesDir(dataDir), { recursive: true });
   ui.info(`Sniff-live: ${intervalSec}s windows${durationSec > 0 ? ` for ${durationSec}s` : ' until Ctrl+C'} (pktmon capture per window).`);
   const startedAt = Date.now();
+  if (detectPlatform() !== 'windows') return cmdSniffLivePosix(dataDir, { intervalSec, durationSec, startedAt });
   let cycle = 0;
   let stopped = false;
   const stop = () => { stopped = true; };
@@ -2619,6 +2684,62 @@ async function cmdSniffLive(rest) {
       try { fs.rmSync(cap.txtPath, { force: true }); } catch { /* ignore */ }
     }
     try { fs.rmSync(etlPath, { force: true }); } catch { /* ignore */ }
+    const elapsed = (Date.now() - startedAt) / 1000;
+    if (durationSec > 0 && elapsed >= durationSec) break;
+    if (stopped) break;
+  }
+  console.log(ui.dim('Sniff-live stopped cleanly.'));
+}
+// POSIX sniff-live: repeated pcap windows until Ctrl+C / --duration.
+async function cmdSniffLivePosix(dataDir, { intervalSec, durationSec, startedAt }) {
+  const plat = detectPlatform();
+  const be = sniff.captureBackend(plat);
+  fs.mkdirSync(sniff.capturesDir(dataDir), { recursive: true });
+  ui.info(`Sniff-live: ${intervalSec}s ${be.kind} windows${durationSec > 0 ? ` for ${durationSec}s` : ' until Ctrl+C'} on ${plat} (default interface).`);
+  let cycle = 0;
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  if (!replActive) {
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  }
+  if (replActive && replRl) {
+    const rl = replRl;
+    if (!rl.closed) {
+      await new Promise((resolve) => {
+        const done = () => {
+          replStopResolver = null;
+          try { rl.removeListener('close', done); } catch { /* ignore */ }
+          stop();
+          resolve();
+        };
+        replStopResolver = done;
+        try { rl.once('close', done); } catch { /* ignore */ }
+      });
+    }
+    replStopResolver = null;
+  }
+  while (!stopped) {
+    cycle++;
+    const pcapPath = path.join(sniff.capturesDir(dataDir), `live-${Date.now().toString(36)}.pcap`);
+    const cap = await sniff.capturePcapWindow({ pcapPath, seconds: intervalSec, snaplen: 0 });
+    if (!cap.ok) {
+      ui.warn(`window ${cycle}: capture failed (${cap.error})`);
+    } else {
+      const rd = sniff.readPcapText(pcapPath);
+      const summary = sniff.summarizeCapture(sniff.parseEtlText(rd.ok ? rd.text : ''), { seconds: intervalSec, etlPath: '', kept: false });
+      sniff.saveCaptureSummary(dataDir, summary);
+      if (summary.anomalies.length === 0) {
+        ui.ok(`[${cycle}] clean (${summary.packets} packets)`);
+      } else {
+        for (const a of summary.anomalies.slice(0, 5)) {
+          if (a.severity === 'high') ui.err(`[${cycle}] ${a.title}: ${a.detail}`);
+          else ui.warn(`[${cycle}] ${a.title}: ${a.detail}`);
+        }
+        sniffLogAnomalies(dataDir, summary.anomalies, `sniff-live window ${cycle}`);
+      }
+      try { fs.rmSync(pcapPath, { force: true }); } catch { /* ignore */ }
+    }
     const elapsed = (Date.now() - startedAt) / 1000;
     if (durationSec > 0 && elapsed >= durationSec) break;
     if (stopped) break;

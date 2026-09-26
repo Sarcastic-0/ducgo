@@ -1,11 +1,17 @@
-// ducgo packet sniffer - built on Windows pktmon (inbox, no third-party driver).
-// Captures YOUR OWN machine's traffic, converts with etl2txt, parses locally.
-// Capture needs an elevated (Administrator) terminal. Parsing needs none.
-// Every spawned OS command is timeout-guarded. Only the tool data dir is written.
-import { spawnSync } from 'node:child_process';
+// ducgo packet sniffer - per-OS capture backends, shared local analysis.
+//   windows: inbox pktmon (ETL -> etl2txt UTF-16 text, deleted after parse)
+//   linux:   tcpdump or dumpcap (pcap file -> `tcpdump -n -l -v -r` text read
+//            back in-memory, parsed directly; pcap deleted after parse)
+//   darwin:  system tcpdump (same pcap -> text path as Linux)
+// Capture needs privilege (Administrator on Windows, sudo/root on
+// Linux/macOS). Parsing needs none. Every spawned OS command is
+// timeout-guarded. Only the tool data dir is written.
+// The analyzer (analyze/summarizeCapture) is backend-agnostic and untouched.
+import { spawnSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { platform as detectPlatform, isAdmin as platformIsAdmin, hasCmd } from './platform.js';
 
 export const SNIFF_SPAWN_TIMEOUT_MS = 15000;
 export const HIGH_INTEGRITY_SID = 'S-1-16-12288';
@@ -31,13 +37,16 @@ export function pktmonExe() {
   }
 }
 
-export function isAdmin() {
-  try {
-    const r = spawnSync('whoami', ['/groups'], { encoding: 'utf8', timeout: 8000, windowsHide: true });
-    return r.status === 0 && String(r.stdout || '').includes(HIGH_INTEGRITY_SID);
-  } catch {
-    return false;
+export function isAdmin(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    try {
+      const r = spawnSync('whoami', ['/groups'], { encoding: 'utf8', timeout: 8000, windowsHide: true });
+      return r.status === 0 && String(r.stdout || '').includes(HIGH_INTEGRITY_SID);
+    } catch {
+      return false;
+    }
   }
+  return platformIsAdmin(plat);
 }
 
 function runPktmon(args, timeoutMs = SNIFF_SPAWN_TIMEOUT_MS) {
@@ -55,12 +64,63 @@ function runPktmon(args, timeoutMs = SNIFF_SPAWN_TIMEOUT_MS) {
   }
 }
 
-export function driverStatus() {
-  const exe = pktmonExe();
-  if (!exe) return { present: false, admin: false, detail: 'PktMon.exe not found' };
-  const admin = isAdmin();
-  const st = runPktmon(['status']);
-  return { present: true, admin, detail: admin ? (st.ok ? 'driver ready' : st.error) : 'needs an elevated (Administrator) terminal' };
+export function driverStatus(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const exe = pktmonExe();
+    if (!exe) return { present: false, admin: false, platform: plat, backend: 'pktmon', exe: null, detail: 'PktMon.exe not found' };
+    const admin = isAdmin(plat);
+    const st = runPktmon(['status']);
+    return { present: true, admin, platform: plat, backend: 'pktmon', exe, detail: admin ? (st.ok ? 'driver ready' : st.error) : 'needs an elevated (Administrator) terminal' };
+  }
+  const be = captureBackend(plat);
+  const admin = isAdmin(plat);
+  return {
+    present: be.available, admin, platform: plat, backend: be.kind, exe: be.exe,
+    detail: be.available
+      ? (admin ? 'driver ready' : 'needs root - re-run with sudo')
+      : be.detail,
+  };
+}
+
+// ---------- POSIX capture backends (tcpdump / dumpcap) ----------
+export const TCPDUMP_INSTALL_HINT_LINUX = 'install tcpdump: sudo apt install tcpdump (Debian/Ubuntu) / sudo dnf install tcpdump (Fedora) - or wireshark-cli for dumpcap';
+
+// First capture tool on PATH for POSIX (tcpdump preferred, dumpcap fallback).
+// Windows intentionally returns null here (pktmon path is separate).
+export function findPacketExe(plat = detectPlatform()) {
+  if (plat === 'windows') return null;
+  if (hasCmd('tcpdump', plat)) return 'tcpdump';
+  if (hasCmd('dumpcap', plat)) return 'dumpcap';
+  return null;
+}
+
+// Backend descriptor for doctor/sysinfo/sniff-check + capture dispatch.
+// Shape: { platform, kind, exe, available, needsRoot, installHint, detail }.
+export function captureBackend(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const exe = pktmonExe();
+    return {
+      platform: plat, kind: 'pktmon', exe, available: !!exe, needsRoot: true,
+      installHint: 'needs Windows 10 1809+ / 11 (PktMon.exe inbox)',
+      detail: exe ? 'driver ready' : 'PktMon.exe not found (needs Windows 10 1809+ / 11)',
+    };
+  }
+  if (plat === 'darwin') {
+    const exe = findPacketExe(plat);
+    return {
+      platform: plat, kind: exe === 'dumpcap' ? 'dumpcap' : 'tcpdump', exe,
+      available: !!exe, needsRoot: true,
+      installHint: 'tcpdump ships with macOS; capture needs sudo (re-run with sudo)',
+      detail: exe ? 'driver ready' : 'tcpdump not found on PATH (ships with macOS - check PATH)',
+    };
+  }
+  const exe = findPacketExe(plat);
+  return {
+    platform: plat, kind: exe === 'dumpcap' ? 'dumpcap' : 'tcpdump', exe,
+    available: !!exe, needsRoot: true,
+    installHint: TCPDUMP_INSTALL_HINT_LINUX,
+    detail: exe ? 'driver ready' : `no capture tool on PATH (${TCPDUMP_INSTALL_HINT_LINUX})`,
+  };
 }
 
 export function startCapture(etlPath, pktSize = 0) {
@@ -93,6 +153,124 @@ export async function captureWindow({ etlPath, seconds, pktSize = 0 }) {
   return { ok: true, txtPath, error: '' };
 }
 
+// ---------- POSIX pcap capture (tcpdump / dumpcap) ----------
+// Captures YOUR OWN machine's traffic on the default interface to a pcap
+// file. Needs root (run with sudo). Loopback-only traffic is out of scope
+// for the default interface - capture it manually (`tcpdump -i lo`) and
+// parse the pcap with `tcpdump -n -l -v -r` + the same parser.
+// Returns { ok, pcapPath|null, error } with clean guidance, never throws.
+export async function capturePcapWindow({ pcapPath, seconds, snaplen = 0, exe = null, plat = detectPlatform() }) {
+  const tool = exe || findPacketExe(plat);
+  if (!tool) {
+    const be = captureBackend(plat);
+    return { ok: false, pcapPath: null, error: `No capture tool on PATH (${be.installHint})` };
+  }
+  const secs = Math.max(1, Math.floor(Number(seconds) || 0));
+  const snap = String(snaplen === undefined || snaplen === null ? 0 : snaplen);
+  try {
+    fs.mkdirSync(path.dirname(pcapPath), { recursive: true });
+  } catch (e) {
+    return { ok: false, pcapPath: null, error: `Cannot create capture dir: ${String((e && e.message) || e).slice(0, 160)}` };
+  }
+  if (tool === 'dumpcap') {
+    // dumpcap stops itself after the autostop duration.
+    try {
+      const r = spawnSync(tool, ['-i', 'any', '-a', `duration:${secs}`, '-s', snap, '-w', pcapPath],
+        { encoding: 'utf8', timeout: (secs + 20) * 1000, windowsHide: true });
+      if (r.error) return { ok: false, pcapPath: null, error: String(r.error.message || r.error).slice(0, 200) };
+      if (!pcapOk(pcapPath)) {
+        return { ok: false, pcapPath: null, error: dumpcapHint(String(r.stderr || ''), plat) };
+      }
+      return { ok: true, pcapPath, error: '' };
+    } catch (e) {
+      return { ok: false, pcapPath: null, error: String((e && e.message) || e).slice(0, 200) };
+    }
+  }
+  // tcpdump: run detached, wait, SIGINT (flush + close pcap), SIGKILL fallback.
+  let stderr = '';
+  let child = null;
+  try {
+    child = spawn(tool, ['-n', '-U', '-s', snap, '-w', pcapPath], { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+  } catch (e) {
+    return { ok: false, pcapPath: null, error: String((e && e.message) || e).slice(0, 200) };
+  }
+  try {
+    if (child.stderr) child.stderr.on('data', (c) => { stderr += String(c); });
+    child.on('error', () => {});
+    await sleep(secs * 1000);
+  } finally {
+    try { child.kill('SIGINT'); } catch { /* ignore */ }
+    await sleep(900);
+    try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    await new Promise((res) => {
+      let done = false;
+      const fin = () => { if (!done) { done = true; res(); } };
+      try { child.on('close', fin); child.on('exit', fin); } catch { fin(); }
+      setTimeout(fin, 3000);
+    });
+  }
+  if (!pcapOk(pcapPath)) {
+    return { ok: false, pcapPath: null, error: tcpdumpHint(stderr, plat) };
+  }
+  return { ok: true, pcapPath, error: '' };
+}
+
+function pcapOk(pcapPath) {
+  try {
+    const st = fs.statSync(pcapPath);
+    return st.isFile() && st.size > 24; // bigger than the bare pcap global header
+  } catch {
+    return false;
+  }
+}
+function sudoHint(plat) {
+  return plat === 'windows'
+    ? 're-open the terminal as Administrator, then retry'
+    : 're-run with sudo, e.g. sudo node src/cli.js sniff --duration 15';
+}
+function tcpdumpHint(stderr, plat) {
+  const s = String(stderr || '');
+  if (/permission|operation not permitted|denied|you don't have permission/i.test(s)) {
+    return `tcpdump captured nothing (permission denied) - ${sudoHint(plat)}`;
+  }
+  if (/no such device|no suitable device|can't open|error/i.test(s)) {
+    return `tcpdump captured nothing (${s.slice(0, 140) || 'no packets on the default interface'}) - ${sudoHint(plat)}`;
+  }
+  return `tcpdump captured nothing (no packets on the default interface in this window) - ${sudoHint(plat)}`;
+}
+function dumpcapHint(stderr, plat) {
+  const s = String(stderr || '');
+  if (/permission|denied|can't open/i.test(s)) {
+    return `dumpcap captured nothing (permission denied) - ${sudoHint(plat)}`;
+  }
+  return `dumpcap captured nothing (${s.slice(0, 140) || 'no packets captured'}) - ${sudoHint(plat)}`;
+}
+
+// Convert a pcap file to text IN MEMORY (`tcpdump -n -l -v -r`) for the
+// shared parser. No intermediate .txt file is written.
+// Returns { ok, text, error }.
+export function readPcapText(pcapPath, exe = null, plat = detectPlatform()) {
+  const tool = exe || findPacketExe(plat) || 'tcpdump';
+  try {
+    const r = spawnSync(tool, ['-n', '-l', '-v', '-r', pcapPath],
+      { encoding: 'utf8', timeout: SNIFF_SPAWN_TIMEOUT_MS, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+    if (r.error) return { ok: false, text: '', error: String(r.error.message || r.error).slice(0, 200) };
+    if (r.status !== 0) {
+      return { ok: false, text: '', error: `${tool} -r exited ${r.status}: ${String(r.stderr || '').slice(0, 200)}` };
+    }
+    return { ok: true, text: String(r.stdout || ''), error: '' };
+  } catch (e) {
+    return { ok: false, text: '', error: String((e && e.message) || e).slice(0, 200) };
+  }
+}
+
+// tcpdump `-n -l -v` stdout shares the IPv4 `a.b.c.d.port > e.f.g.h.port:`
+// line shapes (plus `A? name` DNS with -v) with etl2txt, so it flows through
+// the same parser and the shared analyze() is reused untouched.
+export function parseTcpdumpText(text) {
+  return parseEtlText(text);
+}
+
 // etl2txt writes UTF-16 LE (BOM FFFE). Node must decode it explicitly -
 // reading it as UTF-8 yields NUL-separated text no regex can match.
 export function readEtlText(txtPath) {
@@ -103,10 +281,14 @@ export function readEtlText(txtPath) {
 }
 
 // Wrapped lines (not starting a new "[..].." event) belong to the previous event.
+// tcpdump (`-n -l -v`) lines start with a `HH:MM:SS.micro` timestamp and are
+// likewise joined with their indented continuations. ETL matching is first,
+// so Windows parsing is byte-identical.
 export function joinWrappedLines(text) {
   const out = [];
   for (const raw of String(text || '').split(/\r?\n/)) {
     if (/^\s*\[[0-9A-Fa-f]{2}\]/.test(raw)) out.push(raw.trim());
+    else if (/^\d{1,2}:\d{2}:\d{2}(\.\d+)?\s/.test(raw.trim())) out.push(raw.trim());
     else if (raw.trim() !== '' && out.length > 0) out[out.length - 1] += ' ' + raw.trim();
   }
   return out;
@@ -189,7 +371,10 @@ export function parseEtlText(text) {
     if (dir === 'Rx') dirRx += 1;
     else if (dir === 'Tx') dirTx += 1;
     const sizeM = ev.match(RE_SIZE);
-    const bytes = sizeM ? Number(sizeM[1]) || 0 : 0;
+    // tcpdump lines carry `length N` instead of `OriginalSize N` - used only
+    // as a fallback so ETL byte accounting is byte-identical.
+    const lenM = sizeM ? null : ev.match(/[, ]length (\d+)/);
+    const bytes = sizeM ? Number(sizeM[1]) || 0 : lenM ? Number(lenM[1]) || 0 : 0;
 
     const tm = ev.match(RE_TCP);
     if (tm) {

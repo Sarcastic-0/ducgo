@@ -1,8 +1,17 @@
 // ducgo v3 - network sentinel (proactive, honest, stdlib-only).
-// Read-only Windows queries via child_process + parsing. No packet capture:
-// real sniffing needs a companion such as Npcap / Wireshark (documented in
-// README). This module never modifies system state - it only reads OS tables
-// and writes baselines under the tool data dir (MIRAGENET_DIR).
+// Read-only OS-table queries via child_process + parsing, per-OS backends:
+//   windows: netstat -ano + tasklist, arp -a, netsh wlan
+//   linux:   ss -tunp (fallback legacy netstat), ip neigh (fallback arp -a),
+//            nmcli dev wifi (fallback iwlist scan)
+//   darwin:  netstat -anv -p tcp/udp (no PID column - PIDs reported as 0,
+//            use lsof externally for pid mapping), arp -a (BSD format),
+//            airport -s (system wireless tool)
+// No packet capture: real sniffing lives in the sniff group (pktmon on
+// Windows, tcpdump/dumpcap on Linux/macOS). This module never modifies
+// system state - it only reads OS tables and writes baselines under the
+// tool data dir (MIRAGENET_DIR). Every collector returns
+// { ok, data..., error } so callers print clean
+// "not available on <os>: <what to install>" guidance instead of crashing.
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -10,6 +19,7 @@ import * as crypto from 'node:crypto';
 import * as net from 'node:net';
 import * as dns from 'node:dns';
 import { spawnSync } from 'node:child_process';
+import { platform as detectPlatform, hostsPath as platformHostsPath, hasCmd } from './platform.js';
 
 export const SENTINEL_VERSION = '3.0.4';
 export const CMD_TIMEOUT_MS = 8000;
@@ -112,6 +122,135 @@ function extractIp(addr) {
   return host || '*';
 }
 
+// ---------- Linux `ss` parser ----------
+// Parses `ss -tunp` (also accepts -tulnp / -tnp) output:
+//   Netid State Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+// Returns the same shape as parseNetstat: { listeners, conns }.
+export function parseSs(text) {
+  const listeners = [];
+  const conns = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^netid\b/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 5) continue;
+    const netid = parts[0].toLowerCase();
+    const proto = netid.startsWith('tcp') ? 'TCP' : netid.startsWith('udp') ? 'UDP' : null;
+    if (!proto) continue;
+    let state = (parts[1] || '').toUpperCase();
+    if (state === 'ESTAB') state = 'ESTABLISHED';
+    if (state === 'LISTENING') state = 'LISTEN';
+    const local = parts[4] || '';
+    const peer = parts[5] || '';
+    const pidM = line.match(/pid=(\d+)/);
+    const pid = pidM ? Number(pidM[1]) : 0;
+    const port = extractPort(local);
+    const peerWild = peer === '*:*' || peer === '*' || /:(\*)$/.test(peer) || peer === '0.0.0.0:*' || peer === '[::]:*';
+    if (state === 'LISTEN' || (proto === 'UDP' && (state === 'UNCONN' || peerWild))) {
+      listeners.push({ proto, local, port, pid });
+    } else if (proto === 'TCP') {
+      conns.push({
+        proto, local, remote: peer, remoteIp: extractIp(peer), remotePort: extractPort(peer),
+        state: state || 'UNKNOWN', pid,
+      });
+    }
+  }
+  return { listeners, conns };
+}
+
+// ---------- Linux legacy `netstat -tulnp` parser ----------
+// Fallback when `ss` (iproute2) is missing but net-tools is present:
+//   Proto Recv-Q Send-Q Local Address Foreign Address State PID/Program name
+// Same { listeners, conns } shape. PIDs come as `1234/sshd` (leading digits).
+export function parseLinuxNetstat(text) {
+  const listeners = [];
+  const conns = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^proto\b/i.test(line)) continue;
+    if (/^active/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) continue;
+    const p0 = parts[0].toUpperCase();
+    const proto = p0.startsWith('TCP') ? 'TCP' : p0.startsWith('UDP') ? 'UDP' : null;
+    if (!proto) continue;
+    const local = parts[3] || '';
+    const foreign = parts[4] || '';
+    let state = '';
+    let pidPart = '';
+    if (proto === 'TCP') {
+      state = (parts[5] || '').toUpperCase();
+      pidPart = parts[6] || '';
+    } else {
+      pidPart = parts[5] || '';
+      if (parts[6] && /^\d/.test(parts[6])) pidPart = parts[6];
+    }
+    const pidM = String(pidPart).match(/^(\d+)/);
+    const pid = pidM ? Number(pidM[1]) : 0;
+    const port = extractPort(local);
+    if (state === 'LISTEN' || (proto === 'UDP' && /:(\*)$/.test(foreign))) {
+      listeners.push({ proto, local, port, pid });
+    } else if (proto === 'TCP') {
+      conns.push({
+        proto, local, remote: foreign, remoteIp: extractIp(foreign), remotePort: extractPort(foreign),
+        state: state || 'UNKNOWN', pid,
+      });
+    }
+  }
+  return { listeners, conns };
+}
+
+// ---------- macOS `netstat -anv -p tcp/udp` parser ----------
+// Darwin uses dots (not colons) for ports: `192.168.1.5.54321`, `*.5353`,
+// `*.*`. There is NO PID column (best-effort: a `pid=NNN` token is honored
+// when present, otherwise pid is 0 - use `lsof -i` externally for mapping).
+// Same { listeners, conns } shape.
+function darwinSplit(addr) {
+  const s = String(addr || '');
+  if (s === '*.*' || s === '*') return { ip: '*', port: 0 };
+  const idx = s.lastIndexOf('.');
+  if (idx === -1) return { ip: s || '*', port: 0 };
+  const tail = s.slice(idx + 1);
+  if (!/^\d+$/.test(tail)) return { ip: s, port: 0 };
+  return { ip: s.slice(0, idx) || '*', port: Number(tail) };
+}
+export function parseDarwinNetstat(text) {
+  const listeners = [];
+  const conns = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (/^active/i.test(line)) continue;
+    if (/^proto\b/i.test(line)) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length < 4) continue;
+    const p0 = parts[0].toLowerCase();
+    const proto = p0.startsWith('tcp') ? 'TCP' : p0.startsWith('udp') ? 'UDP' : null;
+    if (!proto) continue;
+    const local = parts[3] || '';
+    const foreign = parts[4] || '';
+    const state = (parts[5] || '').toUpperCase();
+    const pidM = line.match(/pid[=:\s]+(\d+)/i);
+    const pid = pidM ? Number(pidM[1]) : 0;
+    const l = darwinSplit(local);
+    const f = darwinSplit(foreign);
+    if (state === 'LISTEN' || (proto === 'UDP' && (foreign === '*.*' || foreign === '*'))) {
+      listeners.push({ proto, local, port: l.port, pid });
+    } else if (proto === 'TCP') {
+      conns.push({
+        proto, local, remote: foreign, remoteIp: f.ip, remotePort: f.port,
+        state: state || 'UNKNOWN', pid,
+      });
+    }
+  }
+  return { listeners, conns };
+}
+
 // ---------- arp parser ----------
 // Parses Windows `arp -a` (one or more interfaces).
 // Returns [{ ip, mac, type, iface }]. MACs kept raw + normalized compare helper.
@@ -153,6 +292,48 @@ export function diffArp(baselineMap, currentList) {
     if (!(ip in cur)) gone.push({ ip, oldMac: base[ip] });
   }
   return { added, changed, gone };
+}
+
+// ---------- BSD `arp -a` parser (macOS + Linux net-tools fallback) ----------
+// Lines look like:
+//   ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]
+//   gateway (192.168.1.1) at aa:bb:cc:dd:ee:ff on eth0
+// `(incomplete)` entries carry no MAC and are skipped. Same shape as
+// parseArp: [{ ip, mac, type, iface }] (type is dynamic/permanent only;
+// BSD output has no Windows-style static/dynamic column).
+export function parseArpBsd(text) {
+  const out = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+(\S+)\s+on\s+(\S+)/);
+    if (!m) continue;
+    const mac = String(m[2]).toLowerCase().replace(/-/g, ':');
+    if (/incomplete/.test(mac)) continue;
+    if (!/^[0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5}$/.test(mac)) continue;
+    out.push({ ip: m[1], mac, type: /permanent/i.test(line) ? 'permanent' : 'dynamic', iface: m[3] });
+  }
+  return out;
+}
+
+// ---------- Linux `ip neigh` parser ----------
+// Lines look like:
+//   192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+//   192.168.1.99 dev eth0 FAILED   (no lladdr -> skipped, nothing to compare)
+// Same [{ ip, mac, type, iface }] shape; type is the neigh state lowercased.
+export function parseIpNeigh(text) {
+  const out = [];
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/^(\d{1,3}(?:\.\d{1,3}){3})\s+dev\s+(\S+)(?:\s+lladdr\s+([0-9a-fA-F:]{17}))?\s*(\S+)?/);
+    if (!m) continue;
+    if (!m[3]) continue;
+    out.push({ ip: m[1], mac: m[3].toLowerCase(), type: String(m[4] || 'dynamic').toLowerCase(), iface: m[2] });
+  }
+  return out;
 }
 
 // ---------- tasklist parser ----------
@@ -279,6 +460,101 @@ export function detectEvilTwin(baselineWifi, currentWifi) {
   return alerts;
 }
 
+// ---------- Linux `nmcli` wifi parser ----------
+// Parses `nmcli -t -f SSID,SIGNAL,SECURITY,BSSID dev wifi` (colon-separated,
+// BSSID always last). Empty SECURITY means an open network (mapped to
+// 'Open' so evil-twin heuristics keep working). One line per BSSID; lines
+// sharing an SSID are grouped. Same shape as parseNetshWlan:
+// [{ ssid, auth, encryption, bssids: [{ bssid, signal, radio, channel }] }].
+export function parseNmcli(text) {
+  const bySsid = new Map();
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/^(.*):(\d+):([^:]*):([0-9A-Fa-f:]{17})\s*$/);
+    if (!m) continue;
+    const ssid = m[1].replace(/\\:/g, ':');
+    const signal = m[2];
+    const sec = m[3].trim() || 'Open';
+    const bssid = m[4].toLowerCase();
+    if (!bySsid.has(ssid)) bySsid.set(ssid, { ssid, auth: sec, encryption: '', bssids: [] });
+    const e = bySsid.get(ssid);
+    if (e.auth === 'Open' && sec !== 'Open') e.auth = sec;
+    e.bssids.push({ bssid, signal: signal ? signal + '%' : '', radio: '', channel: '' });
+  }
+  return [...bySsid.values()];
+}
+
+// ---------- Linux `iwlist scan` fallback parser (best-effort) ----------
+// Cells look like:
+//   Cell 01 - Address: AA:BB:CC:DD:EE:FF
+//     ESSID:"HomeNet"
+//     Frequency:2.437 GHz (Channel 6)
+//     Quality=70/70  Signal level=-40 dBm
+//     Encryption key:on
+//     IE: WPA Version 1
+// Same grouped wifi shape as above. Signal/quality formats vary by driver;
+// anything unrecognized stays '' rather than failing the row.
+export function parseIwlist(text) {
+  const cells = [];
+  let cur = null;
+  const flush = () => { if (cur) cells.push(cur); cur = null; };
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    const cell = line.match(/^Cell\s+\d+\s+-\s+Address:\s*([0-9A-Fa-f:]{17})/i);
+    if (cell) {
+      flush();
+      cur = { ssid: '', auth: '', encryption: '', bssids: [{ bssid: cell[1].toLowerCase(), signal: '', radio: '', channel: '' }] };
+      continue;
+    }
+    if (!cur) continue;
+    const ess = line.match(/^ESSID:\s*"(.*)"\s*$/);
+    if (ess) { cur.ssid = ess[1]; continue; }
+    const ch = line.match(/\(Channel\s+(\d+)\)/i);
+    if (ch) { cur.bssids[0].channel = ch[1]; continue; }
+    const sig = line.match(/Signal level[=:\s]+(-?\d+\s*dBm|\d+\/\d+)/i);
+    if (sig) { cur.bssids[0].signal = sig[1]; continue; }
+    if (/^Encryption key:\s*off/i.test(line)) { cur.auth = 'Open'; continue; }
+    if (/^Encryption key:\s*on/i.test(line)) { if (!cur.auth) cur.auth = 'WEP/Unknown'; continue; }
+    const ie = line.match(/^IE:\s*(WPA[^;]*)/i);
+    if (ie) { cur.auth = ie[1].trim(); continue; }
+  }
+  flush();
+  const merged = new Map();
+  for (const n of cells) {
+    if (!merged.has(n.ssid)) merged.set(n.ssid, { ssid: n.ssid, auth: n.auth, encryption: '', bssids: [] });
+    const e = merged.get(n.ssid);
+    if (!e.auth && n.auth) e.auth = n.auth;
+    for (const b of n.bssids) e.bssids.push(b);
+  }
+  return [...merged.values()];
+}
+
+// ---------- macOS `airport -s` parser ----------
+// System tool: /System/Library/PrivateFrameworks/Apple80211.framework/.../airport
+//   SSID BSSID             RSSI CHANNEL HT CC SECURITY (auth/privacy)
+//   HomeNet aa:bb:cc:...   -60  6       Y  US WPA2(PSK/AES/AES)
+// SSIDs may contain spaces (everything before the BSSID column). RSSI is
+// kept as `-60 dBm`. Same grouped wifi shape as above.
+export const AIRPORT_EXE = '/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport';
+export function parseAirport(text) {
+  const bySsid = new Map();
+  const lines = String(text || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = String(raw).replace(/\s+$/, '');
+    if (!line.trim()) continue;
+    if (/^\s*SSID\s+BSSID\s+RSSI/i.test(line)) continue;
+    const m = line.match(/^(.*?)\s+([0-9A-Fa-f:]{17})\s+(-\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*\S)\s*$/);
+    if (!m) continue;
+    const ssid = m[1].trim();
+    const bssid = m[2].toLowerCase();
+    if (!bySsid.has(ssid)) bySsid.set(ssid, { ssid, auth: m[7].trim(), encryption: '', bssids: [] });
+    bySsid.get(ssid).bssids.push({ bssid, signal: m[3] + ' dBm', radio: '', channel: m[4] });
+  }
+  return [...bySsid.values()];
+}
+
 export function diffListeners(baseline, current) {
   const key = (l) => `${String(l.proto || '').toUpperCase()}:${Number(l.port || 0)}`;
   const bset = new Set((baseline || []).map(key));
@@ -288,10 +564,9 @@ export function diffListeners(baseline, current) {
   return { added, gone };
 }
 
-// ---------- hosts file ----------
-export function getHostsPath() {
-  const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
-  return path.join(root, 'System32', 'drivers', 'etc', 'hosts');
+// ---------- hosts file (per-OS path via platform.js) ----------
+export function getHostsPath(plat = detectPlatform()) {
+  return platformHostsPath(plat);
 }
 export function sha256String(s) {
   return crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
@@ -301,8 +576,8 @@ export function sha256File(fp) {
   h.update(fs.readFileSync(fp));
   return h.digest('hex');
 }
-export function readHostsHash() {
-  const fp = getHostsPath();
+export function readHostsHash(plat = detectPlatform()) {
+  const fp = getHostsPath(plat);
   try {
     const raw = fs.readFileSync(fp, 'utf8');
     return { ok: true, path: fp, hash: sha256String(raw), size: Buffer.byteLength(raw, 'utf8'), error: '' };
@@ -311,43 +586,183 @@ export function readHostsHash() {
   }
 }
 
-// ---------- live OS snapshots (best-effort, always timeout-guarded) ----------
-export function getNetstatSnapshot() {
-  const r = runOs('netstat', ['-ano'], CMD_TIMEOUT_MS);
-  if (!r.ok) return { ok: false, error: r.error, listeners: [], conns: [] };
+// ---------- live OS snapshots (per-OS backends, timeout-guarded) ----------
+// Every collector returns { ok, ..., error }. On failure `error` is a clean
+// "not available on <os>: <what to install>" message - callers surface it,
+// nothing throws. The Windows paths are byte-identical to v3.0.4.
+function unavailable(plat, what, hint) {
+  return `not available on ${plat}: ${what} (${hint})`;
+}
+export function getNetstatSnapshot(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const r = runOs('netstat', ['-ano'], CMD_TIMEOUT_MS);
+    if (!r.ok) return { ok: false, error: r.error, listeners: [], conns: [] };
+    try {
+      const p = parseNetstat(r.stdout);
+      return { ok: true, error: '', listeners: p.listeners, conns: p.conns };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e).slice(0, 200), listeners: [], conns: [] };
+    }
+  }
+  if (plat === 'linux') {
+    const r = runOs('ss', ['-tunp'], CMD_TIMEOUT_MS);
+    if (r.ok) {
+      try {
+        const p = parseSs(r.stdout);
+        return { ok: true, error: '', listeners: p.listeners, conns: p.conns };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e).slice(0, 200), listeners: [], conns: [] };
+      }
+    }
+    const fb = runOs('netstat', ['-tulnp'], CMD_TIMEOUT_MS);
+    if (fb.ok) {
+      try {
+        const p = parseLinuxNetstat(fb.stdout);
+        return { ok: true, error: '', listeners: p.listeners, conns: p.conns };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e).slice(0, 200), listeners: [], conns: [] };
+      }
+    }
+    return { ok: false, error: unavailable(plat, 'listener table unreadable', 'install iproute2 for `ss -tunp` (or net-tools for legacy `netstat -tulnp`)'), listeners: [], conns: [] };
+  }
+  // darwin: two netstat passes (tcp + udp). No PID column exists - pids are
+  // 0 by design; map processes externally with `lsof -i`.
+  const t = runOs('netstat', ['-anv', '-p', 'tcp'], CMD_TIMEOUT_MS);
+  const u = runOs('netstat', ['-anv', '-p', 'udp'], CMD_TIMEOUT_MS);
+  if (!t.ok && !u.ok) {
+    return { ok: false, error: unavailable(plat, 'listener table unreadable', '`netstat -anv -p tcp` / `-p udp` both failed'), listeners: [], conns: [] };
+  }
   try {
-    const p = parseNetstat(r.stdout);
-    return { ok: true, error: '', listeners: p.listeners, conns: p.conns };
+    const pt = t.ok ? parseDarwinNetstat(t.stdout) : { listeners: [], conns: [] };
+    const pu = u.ok ? parseDarwinNetstat(u.stdout) : { listeners: [], conns: [] };
+    return { ok: true, error: '', listeners: [...pt.listeners, ...pu.listeners], conns: pt.conns };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e).slice(0, 200), listeners: [], conns: [] };
   }
 }
-export function getArpTable() {
+export function getArpTable(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const r = runOs('arp', ['-a'], CMD_TIMEOUT_MS);
+    if (!r.ok) return { ok: false, error: r.error, entries: [] };
+    try {
+      return { ok: true, error: '', entries: parseArp(r.stdout) };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e).slice(0, 200), entries: [] };
+    }
+  }
+  if (plat === 'linux') {
+    const r = runOs('ip', ['neigh', 'show'], CMD_TIMEOUT_MS);
+    if (r.ok) {
+      try {
+        return { ok: true, error: '', entries: parseIpNeigh(r.stdout) };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e).slice(0, 200), entries: [] };
+      }
+    }
+    const fb = runOs('arp', ['-a'], CMD_TIMEOUT_MS);
+    if (fb.ok) {
+      try {
+        return { ok: true, error: '', entries: parseArpBsd(fb.stdout) };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e).slice(0, 200), entries: [] };
+      }
+    }
+    return { ok: false, error: unavailable(plat, 'ARP table unreadable', 'install iproute2 for `ip neigh` (or net-tools for `arp -a`)'), entries: [] };
+  }
   const r = runOs('arp', ['-a'], CMD_TIMEOUT_MS);
-  if (!r.ok) return { ok: false, error: r.error, entries: [] };
+  if (!r.ok) return { ok: false, error: unavailable(plat, 'ARP table unreadable', '`arp -a` failed'), entries: [] };
   try {
-    return { ok: true, error: '', entries: parseArp(r.stdout) };
+    return { ok: true, error: '', entries: parseArpBsd(r.stdout) };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e).slice(0, 200), entries: [] };
   }
 }
-export function getWifiNetworks() {
-  const r = runOs('netsh', ['wlan', 'show', 'networks', 'mode=bssid'], CMD_TIMEOUT_MS);
-  if (!r.ok) return { ok: false, error: r.error, networks: [] };
+// Wireless interface names for the Linux iwlist fallback (best-effort:
+// anything under /sys/class/net except lo; empty list when unreadable).
+export function wirelessIfaces() {
   try {
-    return { ok: true, error: '', networks: parseNetshWlan(r.stdout) };
+    return fs.readdirSync('/sys/class/net').filter((n) => n && n !== 'lo');
+  } catch {
+    return [];
+  }
+}
+export function getWifiNetworks(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const r = runOs('netsh', ['wlan', 'show', 'networks', 'mode=bssid'], CMD_TIMEOUT_MS);
+    if (!r.ok) return { ok: false, error: r.error, networks: [] };
+    try {
+      return { ok: true, error: '', networks: parseNetshWlan(r.stdout) };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e).slice(0, 200), networks: [] };
+    }
+  }
+  if (plat === 'linux') {
+    const r = runOs('nmcli', ['-t', '-f', 'SSID,SIGNAL,SECURITY,BSSID', 'dev', 'wifi'], 15000);
+    if (r.ok) {
+      try {
+        return { ok: true, error: '', networks: parseNmcli(r.stdout) };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e).slice(0, 200), networks: [] };
+      }
+    }
+    for (const iface of wirelessIfaces()) {
+      const s = runOs('iwlist', [iface, 'scan'], 15000);
+      if (!s.ok) continue;
+      try {
+        return { ok: true, error: '', networks: parseIwlist(s.stdout) };
+      } catch { /* try next iface */ }
+    }
+    return { ok: false, error: unavailable(plat, 'Wi-Fi scan unavailable', 'install network-manager for `nmcli dev wifi` (or wireless-tools for `iwlist <iface> scan`); needs a wireless adapter'), networks: [] };
+  }
+  const r = runOs(AIRPORT_EXE, ['-s'], 15000);
+  if (!r.ok) return { ok: false, error: unavailable(plat, 'Wi-Fi scan unavailable', `system airport tool failed (${r.error || 'not found'})`), networks: [] };
+  try {
+    return { ok: true, error: '', networks: parseAirport(r.stdout) };
   } catch (e) {
     return { ok: false, error: String((e && e.message) || e).slice(0, 200), networks: [] };
   }
 }
-export function getTasklistMap() {
-  const r = runOs('tasklist', ['/FO', 'CSV', '/NH'], CMD_TIMEOUT_MS);
-  if (!r.ok) return { ok: false, error: r.error, map: new Map() };
-  try {
-    return { ok: true, error: '', map: parseTasklist(r.stdout) };
-  } catch (e) {
-    return { ok: false, error: String((e && e.message) || e).slice(0, 200), map: new Map() };
+export function getTasklistMap(plat = detectPlatform()) {
+  if (plat === 'windows') {
+    const r = runOs('tasklist', ['/FO', 'CSV', '/NH'], CMD_TIMEOUT_MS);
+    if (!r.ok) return { ok: false, error: r.error, map: new Map() };
+    try {
+      return { ok: true, error: '', map: parseTasklist(r.stdout) };
+    } catch (e) {
+      return { ok: false, error: String((e && e.message) || e).slice(0, 200), map: new Map() };
+    }
   }
+  // POSIX has no tasklist: PIDs stay visible, names stay empty. Callers
+  // (conn-summary) show PIDs only plus this guidance.
+  return { ok: false, error: unavailable(plat, 'process-name mapping', 'PIDs shown without names; map them externally (`ps -o pid,comm` on Linux, Activity Monitor / `lsof` on macOS)'), map: new Map() };
+}
+// Per-OS collector inventory for doctor/sysinfo tables: [source, tool].
+export function describeCollectors(plat = detectPlatform()) {
+  if (plat === 'linux') {
+    return [
+      ['listeners/conns', 'ss -tunp (fallback: netstat -tulnp; needs iproute2)'],
+      ['arp', 'ip neigh show (fallback: arp -a; needs iproute2/net-tools)'],
+      ['wifi', 'nmcli dev wifi (fallback: iwlist <iface> scan)'],
+      ['hosts', '/etc/hosts'],
+      ['dns', 'node:dns lookup (portable)'],
+    ];
+  }
+  if (plat === 'darwin') {
+    return [
+      ['listeners/conns', 'netstat -anv -p tcp/udp (no PID column; PIDs shown as 0)'],
+      ['arp', 'arp -a (BSD format)'],
+      ['wifi', 'airport -s (system wireless tool)'],
+      ['hosts', '/etc/hosts'],
+      ['dns', 'node:dns lookup (portable)'],
+    ];
+  }
+  return [
+    ['listeners/conns', 'netstat -ano + tasklist'],
+    ['arp', 'arp -a'],
+    ['wifi', 'netsh wlan show networks mode=bssid'],
+    ['hosts', '%SystemRoot%\\System32\\drivers\\etc\\hosts'],
+    ['dns', 'node:dns lookup (portable)'],
+  ];
 }
 
 function lookupOne(host, timeoutMs = 5000) {
@@ -412,14 +827,15 @@ export async function scanLoopbackPorts(host = '127.0.0.1', ports = COMMON_PORTS
 }
 
 // Quick snapshot: fast local tables only (loopback-safe, listen-loop friendly).
-export function collectQuickSnapshot() {
-  const ns = getNetstatSnapshot();
-  const arpR = getArpTable();
-  const hosts = readHostsHash();
+export function collectQuickSnapshot(plat = detectPlatform()) {
+  const ns = getNetstatSnapshot(plat);
+  const arpR = getArpTable(plat);
+  const hosts = readHostsHash(plat);
   const arpMap = {};
   for (const e of arpR.entries || []) arpMap[e.ip] = e.mac;
   return {
     at: new Date().toISOString(),
+    platform: plat,
     listeners: ns.ok ? ns.listeners : [],
     conns: ns.ok ? ns.conns : [],
     netstatOk: ns.ok, netstatError: ns.error || '',
@@ -431,9 +847,9 @@ export function collectQuickSnapshot() {
 }
 
 // Full snapshot: quick + wifi + dns + loopback port scan (used by baseline/check).
-export async function collectFullSnapshot() {
-  const quick = collectQuickSnapshot();
-  const wifi = getWifiNetworks();
+export async function collectFullSnapshot(plat = detectPlatform()) {
+  const quick = collectQuickSnapshot(plat);
+  const wifi = getWifiNetworks(plat);
   const dnsMap = await resolveDnsList();
   const openPorts = await scanLoopbackPorts('127.0.0.1', COMMON_PORTS, 350);
   return {

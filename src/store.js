@@ -1,9 +1,11 @@
 // MirageNet v2 - data directory: config.json + events.jsonl. Stdlib only.
-// Default data dir is %USERPROFILE%\.miragenet. MIRAGENET_DIR overrides it
-// (used by the selftest and scripting so tests never touch the real store).
+// Default data dir is ~/.miragenet on every OS (Windows: %USERPROFILE%\.miragenet).
+// MIRAGENET_DIR overrides it (used by the selftest and scripting so tests
+// never touch the real store).
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { dataDir as platformDataDir } from './platform.js';
 
 export const DEFAULT_PORTS = [2222, 2323, 8080];
 export const DEFAULT_HTTP_PORT = 18080;
@@ -11,7 +13,7 @@ export const DEFAULT_HTTP_PORT = 18080;
 export function getDataDir() {
   const override = process.env.MIRAGENET_DIR;
   if (override && override.trim()) return path.resolve(override.trim());
-  return path.join(os.homedir(), '.miragenet');
+  return platformDataDir();
 }
 
 export function ensureDataDir(dir) {
