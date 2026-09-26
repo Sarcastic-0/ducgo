@@ -35,7 +35,7 @@ Requires Node.js 18+. Same 92 commands on Windows, Linux, and macOS
 (see `docs/INSTALL.md` for per-OS prerequisites).
 
 ```powershell
-cd "C:\Users\LORD laptop\Documents\MirageNet"
+cd path\to\ducgo   # wherever you cloned this repo
 node src/cli.js --help
 ```
 
